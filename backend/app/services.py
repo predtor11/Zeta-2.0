@@ -39,7 +39,11 @@ from app.tools.base import ToolRegistry
 from app.tools.browser.service import BrowserService
 from app.tools.filesystem.index import FileIndex
 from app.tools.terminal import TerminalService
+from app.core import gpu
 from app.voice.wakeword import WakeWordService
+
+VOICE_VRAM_MB = 2400   # what Chatterbox needs on the GPU, measured on an RTX 4070 Laptop
+SMALL_GPU_MB = 12288   # at or below this, the voice and an 8B model cannot both be resident
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +111,55 @@ class ZetaServices:
         return speech_style.style_for(self.emotion.current if self.settings.emotion_enabled else None,
                                       reply, enabled=self.settings.emotion_adapt_voice)
 
+    # ------------------------------------------------------------------ sharing one GPU
+    async def balance_gpu(self, want: str) -> None:
+        """Make room on the GPU for whichever of the two big models is about to run.
+
+        Ollama needs about 6 GB for an 8B model and Chatterbox about 2 GB. On an 8 GB laptop
+        card they do not both fit, and neither of them says so: Ollama silently moves layers to
+        the CPU (ten times slower, which is where the timeouts came from) and Chatterbox falls
+        back to CPU generation. Since a reply is generated and *then* spoken, they never
+        actually need the card at the same time - so Zeta hands it over explicitly.
+
+        Only small cards pay for this. With plenty of VRAM both models stay resident.
+        """
+        if not self._gpu_shared():
+            return
+        try:
+            if want == "llm":
+                # Parking is a no-op if the voice is already parked, so this is cheap to call.
+                release = getattr(self.tts, "release_gpu", None)
+                if release and await release():
+                    log.info("Voice parked so the language model gets the whole GPU.")
+            elif want == "voice" and not self.tasks.active():
+                # Measured on an RTX 4070 Laptop: speaking with the language model still resident
+                # takes 57s for a 5s clip, because Chatterbox spills into shared memory. With the
+                # model out of the way the same clip takes 8s. Reloading it on the next turn costs
+                # two or three seconds, so this is worth doing whenever the card is this small -
+                # not only once free VRAM has already run out. Never mid-turn, though: a running
+                # task will want the model again in a moment.
+                unload = getattr(self.llm, "unload", None)
+                if unload and await unload():
+                    log.info("Language model unloaded so the voice can speak on the GPU "
+                             "(it reloads on the next turn).")
+        except Exception as e:  # noqa: BLE001
+            log.debug("gpu handover (%s) failed: %s", want, e)
+
+    def _gpu_shared(self) -> bool:
+        """Should Zeta arbitrate the GPU? Automatic on a card too small to hold both models."""
+        mode = (self.settings.gpu_share or "auto").lower()
+        if mode in ("off", "false", "no"):
+            return False
+        mem = gpu.gpu_memory()
+        if not mem:
+            return False                     # no NVIDIA GPU: nothing to hand over
+        return mode == "on" or mem[0] < SMALL_GPU_MB
+
+    async def synthesize(self, text: str):
+        """Speak `text` in the current emotional delivery, GPU handover included."""
+        await self.balance_gpu("voice")
+        return await self.tts.synthesize(text, self.speech_style(text))
+
     def _build_wake(self, s: Settings) -> WakeWordService:
         return WakeWordService(enabled=bool(s.wake_word_enabled and s.is_local), phrase=s.wake_word, engine=s.wake_word_engine,
                                model=s.wake_word_model, sensitivity=s.wake_word_sensitivity, device=s.wake_word_device,
@@ -165,10 +218,39 @@ class ZetaServices:
         try:
             h = await self.tts.health()
             if not h.get("ok") and getattr(self.tts, "autostart", False):
+                # The voice loads first and parks itself straight afterwards, so the language
+                # model - loaded next, and much the larger of the two - finds the card empty.
+                # Getting this order wrong is what leaves one of them stranded on the CPU.
+                await self.balance_gpu("voice")
                 await self.tts._ensure_server()          # type: ignore[attr-defined]
                 log.info("Local voice ready.")
         except Exception as e:  # noqa: BLE001
             log.warning("could not start the local voice: %s", str(e)[:160])
+        await self._warm_llm()
+
+    async def _warm_llm(self) -> None:
+        """Load the language model before the first turn needs it, and check where it landed.
+
+        Ollama loads on first use, which puts 10-30 seconds of loading inside the first reply.
+        Worse, if the model does not fit it runs partly on the CPU without saying so - so this
+        also reports the split, which is the one number that explains a slow local model.
+        """
+        warm = getattr(self.llm, "warm", None)
+        if not warm:
+            return
+        await self.balance_gpu("llm")
+        try:
+            placement = await warm()
+        except Exception as e:  # noqa: BLE001
+            log.debug("could not preload the language model: %s", e)
+            return
+        if placement.get("on_cpu"):
+            log.warning("%s does not fit on the GPU: %d MB of %d MB is running on the CPU, which makes replies "
+                        "roughly ten times slower. Free VRAM, or lower LLM_CONTEXT_LENGTH.",
+                        self.settings.llm_model, placement["cpu_mb"], placement["total_mb"])
+        elif placement.get("vram_mb"):
+            log.info("%s loaded: %d MB on the GPU, %d MB VRAM free.", self.settings.llm_model,
+                     placement["vram_mb"], gpu.free_mb())
 
     async def stop(self) -> None:
         self.tasks.cancel_all("server shutting down")
@@ -245,6 +327,7 @@ class ZetaServices:
             self.tasks.set_status(task, TaskStatus.COMPLETED, result=reply, message=reply)
             event_bus.publish("assistant_message", task_id=task.id, conversation_id=conversation_id, content=reply)
             return task
+        await self.balance_gpu("llm")
         task = self.tasks.create(message, conversation_id)
         self.tasks.start(task, self.orchestrator.run(task, message))
         if wait:
@@ -273,6 +356,7 @@ class ZetaServices:
             "voice": {"stt": s.stt_provider.value, "tts": s.tts_provider.value, "stt_ok": stt_h.get("ok", False),
                       "tts_ok": tts_h.get("ok", False), "detail": f"STT {stt_h.get('detail')}; TTS {tts_h.get('detail')}",
                       "wake": self.wake.status()},
+            "gpu": await self._gpu_status(),
             "database": {**database.describe_database_url(s.database_url), **(await database.ping())},
             "emotion": {**self.emotion.status(), "expressive_voice": bool(getattr(self.tts, "expressive", False)),
                         "adapt_voice": s.emotion_adapt_voice},
@@ -285,6 +369,21 @@ class ZetaServices:
             "setup_complete": (PROJECT_DIR / ".env").exists() or (BACKEND_DIR / ".env").exists(),
             "config": s.public_summary(),
         }
+
+    async def _gpu_status(self) -> Dict[str, Any]:
+        """VRAM, and whether the language model is really on it. Absent when there is no GPU."""
+        mem = gpu.gpu_memory()
+        if not mem:
+            return {"present": False}
+        total, free = mem
+        out: Dict[str, Any] = {"present": True, "total_mb": total, "free_mb": free, "shared": self._gpu_shared()}
+        placement = getattr(self.llm, "placement", None)
+        if placement:
+            try:
+                out["llm"] = await placement()
+            except Exception:  # noqa: BLE001
+                pass
+        return out
 
     def cache_audio(self, data: bytes, mime: str) -> str:
         aid = uuid.uuid4().hex[:12]

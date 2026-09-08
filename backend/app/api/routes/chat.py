@@ -17,7 +17,7 @@ async def chat(req: ChatRequest, svc: ZetaServices = Depends(services)) -> ChatR
     audio_url = None
     if req.wait and req.speak and task.result:
         try:
-            data, mime = await svc.tts.synthesize(task.result[:2000], svc.speech_style(task.result))
+            data, mime = await svc.synthesize(task.result[:2000])
             audio_url = f"/api/voice/audio/{svc.cache_audio(data, mime)}"
         except Exception:  # noqa: BLE001
             audio_url = None

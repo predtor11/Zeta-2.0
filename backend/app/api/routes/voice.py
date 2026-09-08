@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -14,6 +15,30 @@ from app.models.schemas import SpeakRequest
 from app.services import ZetaServices
 
 router = APIRouter(prefix="/api/voice", tags=["voice"], dependencies=[Depends(require_auth)])
+
+
+def _audio_seconds(data: bytes, mime: str) -> float:
+    """How long this clip plays for, read out of the WAV header (0.0 if it is not a WAV)."""
+    if "wav" not in mime or len(data) < 44:
+        return 0.0
+    try:
+        import wave
+
+        with wave.open(io.BytesIO(data), "rb") as w:
+            return w.getnframes() / float(w.getframerate() or 1)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _deafen_while_speaking(svc: ZetaServices, data: bytes, mime: str, text: str) -> None:
+    """Stop the wake word listener hearing Zeta's own voice through the speakers.
+
+    The browser pauses it too, but only once playback starts; this covers the gap and the
+    case where nothing is watching the microphone from the UI side. When the clip length is
+    unknown, fall back to a speaking-rate estimate (about 14 characters a second).
+    """
+    seconds = _audio_seconds(data, mime) or len(text) / 14.0
+    svc.wake.pause(min(120.0, seconds + 2.5))
 
 
 async def _analyse_voice(svc: ZetaServices, audio: bytes, mime: str, text: str):
@@ -46,9 +71,10 @@ async def transcribe(file: UploadFile = File(...), language: str = Form(""), svc
 @router.post("/speak")
 async def speak(req: SpeakRequest, svc: ZetaServices = Depends(services)):
     try:
-        data, mime = await svc.tts.synthesize(req.text, svc.speech_style(req.text))
+        data, mime = await svc.synthesize(req.text)
     except ZetaError as e:
         raise HTTPException(503, e.user_message)
+    _deafen_while_speaking(svc, data, mime, req.text)
     return Response(content=data, media_type=mime)
 
 
@@ -83,7 +109,8 @@ async def voice_roundtrip(file: UploadFile = File(...), conversation_id: str = F
     audio_url = None
     if speak and task.result:
         try:
-            data, mime = await svc.tts.synthesize(task.result[:2000], svc.speech_style(task.result))
+            data, mime = await svc.synthesize(task.result[:2000])
+            _deafen_while_speaking(svc, data, mime, task.result)
             audio_url = f"/api/voice/audio/{svc.cache_audio(data, mime)}"
         except ZetaError:
             audio_url = None

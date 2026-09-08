@@ -73,8 +73,68 @@ class OllamaProvider(LLMProvider):
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
             headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout, headers=headers)
+            # Connecting is instant or hopeless; generating is what takes time. Splitting the
+            # two means a stopped Ollama is reported in seconds instead of after the full budget,
+            # and that on a streaming reply the budget applies between chunks, not to the whole
+            # answer - a long reply that is still arriving is not a timeout.
+            timeout = httpx.Timeout(self.timeout, connect=5.0)
+            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, headers=headers)
         return self._client
+
+    # ------------------------------------------------------------------ where the weights are
+    async def placement(self) -> Dict[str, Any]:
+        """Is the model entirely in VRAM, or is part of it running on the CPU?
+
+        Ollama does not complain when a model does not fit: it puts the leftover layers on the
+        CPU and carries on at roughly a tenth of the speed. `/api/ps` is the only place that
+        difference is visible, and it is the difference between a 3-second reply and a timeout.
+        """
+        try:
+            r = await self.client().get("/api/ps", timeout=5.0)
+            models = r.json().get("models") or []
+        except Exception:  # noqa: BLE001
+            return {}
+        for m in models:
+            if m.get("model") == self.model or m.get("name") == self.model:
+                total, vram = int(m.get("size") or 0), int(m.get("size_vram") or 0)
+                return {"model": self.model, "total_mb": total // 2 ** 20, "vram_mb": vram // 2 ** 20,
+                        "cpu_mb": max(0, total - vram) // 2 ** 20, "on_cpu": total > vram + 64 * 2 ** 20,
+                        "context_length": m.get("context_length")}
+        return {"model": self.model, "loaded": False}
+
+    async def warm(self) -> Dict[str, Any]:
+        """Load the model now so the first real turn is not the one that pays for it."""
+        try:
+            await self.client().post("/api/generate", json={"model": self.model, "keep_alive": self.keep_alive,
+                                                            "options": {"num_ctx": self.context_length}})
+        except Exception as e:  # noqa: BLE001
+            log.debug("could not preload %s: %s", self.model, e)
+        return await self.placement()
+
+    async def unload(self) -> bool:
+        """Drop the model from memory now, handing the VRAM to whatever needs it next.
+
+        The next request reloads it from the page cache, which costs a few seconds - far less
+        than one turn spent half on the CPU. Zeta only does this when the GPU is genuinely too
+        full for the voice to speak.
+        """
+        try:
+            r = await self.client().post("/api/generate", json={"model": self.model, "keep_alive": 0}, timeout=30.0)
+            return r.status_code < 400
+        except Exception as e:  # noqa: BLE001
+            log.debug("could not unload %s: %s", self.model, e)
+            return False
+
+    async def _timed_out(self, e: Exception) -> ProviderError:
+        """A timeout with the reason attached, when the reason is knowable."""
+        placement = await self.placement()
+        if placement.get("on_cpu"):
+            detail = (f"The local model took too long. {placement['cpu_mb']} MB of {self.model} does not fit on the "
+                      f"GPU and is running on the CPU, which is around ten times slower. Free some VRAM - close other "
+                      f"GPU applications, or lower LLM_CONTEXT_LENGTH.")
+        else:
+            detail = "The local model took too long to respond."
+        return ProviderError("Ollama timed out", user_message=detail)
 
     async def close(self) -> None:
         if self._client:
@@ -131,7 +191,7 @@ class OllamaProvider(LLMProvider):
             raise ProviderUnavailable(f"Cannot connect to Ollama at {self.base_url}: {e}",
                                       user_message=f"I can't reach Ollama at {self.base_url}. Start it with `ollama serve`.") from e
         except httpx.TimeoutException as e:
-            raise ProviderError("Ollama timed out", user_message="The local model took too long to respond.") from e
+            raise await self._timed_out(e) from e
         if r.status_code >= 400:
             detail = r.text[:500]
             if "think" in detail.lower() and "think" in payload:
@@ -222,7 +282,7 @@ class OllamaProvider(LLMProvider):
             raise ProviderUnavailable(f"Cannot connect to Ollama at {self.base_url}: {e}",
                                       user_message=f"I can't reach Ollama at {self.base_url}. Start it with `ollama serve`.") from e
         except httpx.TimeoutException as e:
-            raise ProviderError("Ollama timed out", user_message="The local model took too long to respond.") from e
+            raise await self._timed_out(e) from e
         return LLMResponse(content=_strip_think(acc.raw), tool_calls=calls, finish_reason=done_reason, usage=usage)
 
     async def embed(self, texts: List[str], model: Optional[str] = None) -> List[List[float]]:

@@ -227,7 +227,8 @@ def build_tts_provider(settings: Settings) -> TTSProvider:
     if p == TTSProviderName.CHATTERBOX:
         return ChatterboxTTS(settings.chatterbox_base_url, settings.chatterbox_voice, settings.chatterbox_model,
                              settings.chatterbox_device, settings.chatterbox_exaggeration, settings.chatterbox_cfg_weight,
-                             settings.chatterbox_temperature, settings.chatterbox_autostart)
+                             settings.chatterbox_temperature, settings.chatterbox_autostart,
+                             idle_unload=settings.chatterbox_idle_unload)
     if p == TTSProviderName.LOCAL:
         return LocalTTS(settings.tts_voice, settings.tts_rate)
     if p == TTSProviderName.PIPER:

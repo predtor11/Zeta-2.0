@@ -133,12 +133,36 @@ Engines (`WAKE_WORD_ENGINE`):
 
 | Engine | How | Cost | Notes |
 |---|---|---|---|
-| `whisper` (default) | Energy-gated: when speech is heard, the last ~2.5 s are transcribed with faster-whisper **tiny** (CPU, int8) and fuzzy-matched | free, some CPU while people talk | Works for any phrase, no training. Decoding is biased towards the phrase; "Zeta", "hey zita", "hey zetta" all match. |
+| `whisper` (default) | Energy-gated: when speech is heard, the last ~2.5 s are transcribed with faster-whisper **tiny** (CPU, int8) and fuzzy-matched | free, some CPU while people talk | Works for any phrase, no training. "Zeta", "hey zita", "hey zetta" all match. |
 | `openwakeword` | Neural wake-word model | free, very low CPU | `pip install openwakeword`; pretrained phrases are `hey_jarvis`, `alexa`, `hey_mycroft`… (`WAKE_WORD_MODEL=hey_jarvis`). A custom "hey zeta" model needs training (openWakeWord's notebook). |
 
+### Not waking up on its own
+
+A tiny Whisper model handed silence does not stay silent - it writes something. Four rules decide
+whether a candidate counts, and `WAKE_WORD_SENSITIVITY` (0-1, default 0.5) moves all four together:
+
+1. **Whisper's VAD runs first.** Room noise produces no segments at all, so there is nothing to
+   mis-read. Decoding is greedy at temperature 0.
+2. **Whisper's own confidence is believed.** A segment is dropped when `no_speech_prob` is high or
+   `avg_logprob` is low - the model saying, in effect, "I made that up".
+3. **Stock hallucinations are rejected**: "you", "Thanks for watching", "so", and any transcript that
+   repeats itself ("hey zeta hey zeta hey zeta"), which is a decoder looping on its own bias.
+4. **The name alone only counts in a short utterance.** "Zeta?" wakes it; "the zeta function is what
+   he meant" does not. Words that sound like the name but are ordinary English - *theta, beta, data,
+   meta* - need the greeting in front of them, and a greeting slot filled by *the*, *a*, *of*… is not
+   a greeting.
+
+There is no `initial_prompt` stuffed with the wake phrase. That is a natural way to make "Zeta"
+recognisable, and it was in Zeta until it turned out to be the reason it woke itself up: given
+nothing to transcribe, the model repeats its own prompt back. `hotwords` does the same job without
+inviting that.
+
+Zeta also deafens the listener for exactly as long as a spoken reply plays (measured from the WAV,
+not guessed from the text length), so it never hears itself through the speakers.
+
 Check it: `GET /api/voice/wake` shows the state, engine, errors and microphone list (`WAKE_WORD_DEVICE`
-picks one). `POST /api/voice/wake/test` simulates a detection to test the UI. The UI pauses the
-listener while it records and while Zeta speaks, so Zeta does not wake itself.
+picks one), plus `rejected` and `last_rejected` - if Zeta is not waking when you speak, that is where
+to look before raising the sensitivity. `POST /api/voice/wake/test` simulates a detection.
 
 Keep the browser tab open: detection happens in the backend, but the recording/transcription of your
 request is done by the UI (microphone permission is remembered after the first manual mic use).
@@ -225,10 +249,8 @@ unlimited voice that can be cloned, keep Chatterbox. Both stay configured; `TTS_
 `multilingual` models honour `exaggeration` and `cfg_weight` directly and Zeta uses those instead.
 Only `turbo` has been exercised end to end here.
 
-**VRAM.** Chatterbox Turbo needs roughly 2 GB. On an 8 GB laptop GPU that is fine on its own, but a
-7B/8B Ollama model with a 16k context can fill the card; if CUDA is full, Chatterbox loads on the CPU
-instead (slower, still usable) and says so in `GET /api/system/status`. Shrinking the LLM's footprint
-(`OLLAMA_KV_CACHE_TYPE=q8_0`, `OLLAMA_FLASH_ATTENTION=1`) leaves room for both.
+**VRAM: one card, two hungry models.** See "Sharing one GPU" below - on an 8 GB card this is the
+single thing that decides whether Zeta feels instant or unusable.
 
 **If Hugging Face is blocked on your network** (the model downloads from there on first run), set
 `HF_ENDPOINT=https://hf-mirror.com` before starting the server. `HF_HUB_DISABLE_XET=1` also avoids a

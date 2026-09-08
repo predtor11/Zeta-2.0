@@ -7,6 +7,9 @@ Why a separate process (and a separate virtualenv):
   it here means the backend still starts in a second and stays swappable.
 * The model must stay resident to be fast, and the GPU can only do one generation
   at a time, so one long-lived process with a lock is exactly right.
+* On a laptop GPU the voice and the local LLM cannot both hold VRAM. Between replies
+  the model is parked in system RAM (`--idle-unload`), which hands its ~2 GB back to
+  Ollama and costs a second or two to undo when Zeta next speaks.
 * Zeta talks to it over plain HTTP, so the same interface works if you later move
   it to another machine, or swap Chatterbox for something else.
 
@@ -18,6 +21,7 @@ Run it with the TTS virtualenv, not the backend one:
 Endpoints:
 
     GET  /health                 model, device, sample rate, whether it is loaded
+    POST /park                   push the model to system RAM now and free the VRAM
     GET  /voices                 the .wav reference clips in voice/
     POST /tts   {"text": ...}    -> audio/wav
 """
@@ -89,15 +93,21 @@ def chunks(text: str, limit: int = MAX_CHARS) -> List[str]:
 class Engine:
     """Loads Chatterbox once and serialises generation (one GPU, one job at a time)."""
 
-    def __init__(self, model: str = "turbo", device: str = "auto", voice: str = ""):
+    def __init__(self, model: str = "turbo", device: str = "auto", voice: str = "", idle_unload: float = 60.0):
         self.model_name = model
         self.requested_device = device
         self.voice = voice
         self.model: Any = None
-        self.device = ""
+        self.device = ""            # where the weights are right now
+        self.home_device = ""       # where they belong when speaking
         self.sr = 24000
         self.error = ""
         self.load_seconds = 0.0
+        self.idle_unload = idle_unload   # seconds of quiet before the VRAM goes back; 0 = never
+        self.parked = False
+        self.ready = False          # loaded *and* warmed up; nothing may move the weights before that
+        self.last_used = time.time()
+        self.park_seconds = 0.0
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ loading
@@ -129,6 +139,7 @@ class Engine:
                 self.error = f"{type(e).__name__}: {e}"
                 log.error("Chatterbox failed to load: %s", self.error)
                 return
+        self.home_device = self.device
         self.sr = int(getattr(self.model, "sr", 24000))
         try:
             # The first generation compiles kernels and allocates buffers; do it now, not
@@ -137,7 +148,77 @@ class Engine:
         except Exception as e:  # noqa: BLE001
             log.warning("warm-up generation failed: %s", str(e)[:160])
         self.load_seconds = time.time() - t0
+        self.last_used = time.time()
+        self.ready = True
         log.info("Chatterbox %s ready on %s in %.1fs (%d Hz)", self.model_name, self.device, self.load_seconds, self.sr)
+        # Nobody is listening yet, so do not sit on the VRAM the LLM needs to load.
+        if self.idle_unload > 0:
+            with self._lock:
+                self.park()
+
+    # ------------------------------------------------------------- sharing the GPU
+    def _move(self, device: str) -> None:
+        """Walk the model's parts onto `device`. Chatterbox is a bag of modules, not one nn.Module."""
+        import torch
+
+        m = self.model
+        for name, value in list(vars(m).items()):
+            if isinstance(value, torch.nn.Module):
+                value.to(device)
+            elif name == "conds" and hasattr(value, "to"):
+                setattr(m, name, value.to(device))
+        if isinstance(getattr(m, "device", None), torch.device):
+            m.device = torch.device(device)
+        else:
+            m.device = device
+        self.device = device
+        if device == "cpu" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def park(self) -> bool:
+        """Move the weights to system RAM and give the VRAM back (to Ollama, usually)."""
+        if not self.ready or self.parked or self.home_device != "cuda":
+            return False
+        t0 = time.time()
+        try:
+            self._move("cpu")
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not park the model: %s", str(e)[:160])
+            return False
+        self.parked = True
+        log.info("Parked in system RAM after %.0fs idle; VRAM released (%.1fs).", self.idle_unload, time.time() - t0)
+        return True
+
+    def resume(self) -> None:
+        """Bring the weights back to the GPU. Falls back to speaking on the CPU if it is full."""
+        if not self.parked:
+            return
+        t0 = time.time()
+        try:
+            self._move(self.home_device)
+            self.parked = False
+            self.park_seconds = time.time() - t0
+            log.info("Back on %s in %.1fs.", self.home_device, self.park_seconds)
+        except Exception as e:  # noqa: BLE001
+            # The LLM has the card. Speaking slowly beats not speaking; try again next time.
+            log.warning("Could not reclaim the GPU (%s); speaking on the CPU this time.", type(e).__name__)
+            try:
+                self._move("cpu")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def reap(self, stop: threading.Event) -> None:
+        """Park the model once it has been quiet for `idle_unload` seconds."""
+        while not stop.wait(5.0):
+            if self.idle_unload <= 0 or not self.ready or self.parked:
+                continue
+            if time.time() - self.last_used < self.idle_unload:
+                continue
+            if self._lock.acquire(blocking=False):
+                try:
+                    self.park()
+                finally:
+                    self._lock.release()
 
     def _load_weights(self, device: str) -> Any:
         """Load from the Hub, or from the local cache when the Hub is unreachable.
@@ -195,6 +276,7 @@ class Engine:
 
         pieces: List["np.ndarray"] = []
         with self._lock:
+            self.resume()
             for part in chunks(clean_text(text)):
                 kwargs: Dict[str, Any] = {"temperature": temperature}
                 if self.model_name == "turbo":
@@ -212,6 +294,7 @@ class Engine:
                 audio = wav.detach().cpu().numpy() if isinstance(wav, torch.Tensor) else np.asarray(wav)
                 pieces.append(audio.reshape(-1))
                 pieces.append(np.zeros(int(self.sr * 0.12), dtype=audio.dtype))   # breath between sentences
+            self.last_used = time.time()
         joined = np.concatenate(pieces[:-1]) if len(pieces) > 1 else pieces[0]
         return to_wav(joined, self.sr)
 
@@ -226,9 +309,23 @@ class Engine:
         return {k: v for k, v in kwargs.items() if k in allowed}
 
     def status(self) -> Dict[str, Any]:
-        return {"ok": self.model is not None, "model": self.model_name, "device": self.device or self.requested_device,
+        return {"ok": self.model is not None, "model": self.model_name, "device": self.home_device or self.requested_device,
                 "sample_rate": self.sr, "voice": self.voice or "built-in", "load_seconds": round(self.load_seconds, 1),
-                "error": self.error}
+                "error": self.error, "parked": self.parked, "holding_device": self.device,
+                "idle_unload": self.idle_unload, "resume_seconds": round(self.park_seconds, 1),
+                "vram_free_mb": free_vram_mb()}
+
+
+def free_vram_mb() -> int:
+    """Unused VRAM on the GPU, or -1 when there is no CUDA device. Handy in /health."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return -1
+        return int(torch.cuda.mem_get_info()[0] / 2 ** 20)
+    except Exception:  # noqa: BLE001
+        return -1
 
 
 def to_wav(samples: Any, sample_rate: int) -> bytes:
@@ -268,7 +365,12 @@ def build_app(engine: Engine):
     async def lifespan(_app):
         # Load in the background so /health answers immediately while the model warms up.
         threading.Thread(target=engine.load, name="chatterbox-load", daemon=True).start()
-        yield
+        stop = threading.Event()
+        threading.Thread(target=engine.reap, args=(stop,), name="chatterbox-idle", daemon=True).start()
+        try:
+            yield
+        finally:
+            stop.set()
 
     app = FastAPI(title="Zeta Chatterbox TTS", docs_url="/docs", lifespan=lifespan)
 
@@ -280,6 +382,20 @@ def build_app(engine: Engine):
     def voices() -> Dict[str, Any]:
         files = sorted(p.name for p in VOICE_DIR.glob("*.wav")) if VOICE_DIR.exists() else []
         return {"dir": str(VOICE_DIR), "voices": files, "current": engine.voice or "built-in"}
+
+    @app.post("/park")
+    def park() -> Dict[str, Any]:
+        """Hand the VRAM back now, without waiting for the idle timer.
+
+        Never waits: if a generation is in flight the weights must not move, and the caller
+        would rather carry on than block. The idle timer will get it a moment later.
+        """
+        if not engine._lock.acquire(blocking=False):
+            return {"parked": False, "busy": True, **engine.status()}
+        try:
+            return {"parked": engine.park(), **engine.status()}
+        finally:
+            engine._lock.release()
 
     @app.post("/tts")
     async def tts(req: Speak) -> Response:
@@ -311,6 +427,9 @@ def main() -> None:
     ap.add_argument("--model", default=os.getenv("CHATTERBOX_MODEL", "turbo"), choices=["turbo", "base", "multilingual"])
     ap.add_argument("--device", default=os.getenv("CHATTERBOX_DEVICE", "auto"), choices=["auto", "cuda", "cpu"])
     ap.add_argument("--voice", default=os.getenv("CHATTERBOX_VOICE", ""), help="reference .wav for the voice (empty = built-in)")
+    ap.add_argument("--idle-unload", type=float, default=float(os.getenv("CHATTERBOX_IDLE_UNLOAD", "60")),
+                    help="seconds of silence before the model is parked in system RAM and the VRAM handed back "
+                         "(0 = keep it on the GPU always)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S")
@@ -323,9 +442,11 @@ def main() -> None:
         print("The TTS virtualenv is missing. Run:  install_tts.bat", file=sys.stderr)
         raise SystemExit(2)
 
-    engine = Engine(model=args.model, device=args.device, voice=args.voice)
+    engine = Engine(model=args.model, device=args.device, voice=args.voice, idle_unload=args.idle_unload)
+    idle = (f"parks after {args.idle_unload:.0f}s idle" if args.idle_unload > 0 and args.device != "cpu"
+            else "stays resident")
     print(f"Chatterbox TTS on http://{args.host}:{args.port}  (model={args.model}, device={args.device}, "
-          f"voice={args.voice or 'built-in'})")
+          f"voice={args.voice or 'built-in'}, {idle})")
     uvicorn.run(build_app(engine), host=args.host, port=args.port, log_level="warning")
 
 

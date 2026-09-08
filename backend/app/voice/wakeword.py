@@ -41,17 +41,49 @@ _WORD_RE = re.compile(r"[a-z]+")
 # Common mis-hearings of "zeta" by small speech models.
 _ALIASES = {"zeta": ["zeta", "zita", "seta", "zetta", "zeeta", "zeda", "seda", "theta", "zaida", "zayda", "zeta's", "zetta's"]}
 
+# "the zeta function" scores 0.88 against "hey zeta" on a plain string comparison, because
+# "the" and "hey" share two letters. A greeting is never one of these, so the slot in front
+# of the name cannot be filled by one.
+_FUNCTION_WORDS = {"the", "a", "an", "of", "in", "on", "to", "at", "by", "for", "that", "this",
+                   "is", "was", "and", "or", "but", "with", "from", "its", "his", "her", "their"}
+
+# Mis-hearings that are also ordinary words. They count inside the full phrase ("hey theta")
+# but never on their own, or a maths lecture would keep waking Zeta up.
+_AMBIGUOUS = {"theta", "seta", "seda", "cedar", "cheetah", "data", "beta", "meta"}
+
+# What a small Whisper model writes when it is handed silence or room noise. If that is the
+# whole transcript then nobody said anything, whatever the decoder guessed.
+_HALLUCINATIONS = {
+    "you", "thank you", "thanks for watching", "thank you for watching", "bye", "bye bye",
+    "please subscribe", "subscribe", "so", "okay", "oh", "hmm", "mm", "yeah", "uh", "the end",
+    "music", "applause", "silence", "thank you very much", "i'm sorry",
+}
+
+
+def looks_hallucinated(text: str) -> bool:
+    """True for the stock things Whisper emits on non-speech, and for stuck repetitions."""
+    stripped = text.strip().lower().strip(" .!?,")
+    if not stripped or stripped in _HALLUCINATIONS:
+        return True
+    words = normalize_words(text)
+    # "hey zeta hey zeta hey zeta" is the decoder looping on its own bias, not a person.
+    return len(words) >= 6 and len(set(words)) <= max(2, len(words) // 3)
+
 
 def normalize_words(text: str) -> List[str]:
     return _WORD_RE.findall(text.lower().replace("'", ""))
 
 
-def phrase_matches(text: str, phrase: str, *, threshold: float = 0.78) -> bool:
+def phrase_matches(text: str, phrase: str, *, threshold: float = 0.78, bare_name_max_words: int = 4) -> bool:
     """Fuzzy check whether `phrase` ("hey zeta") occurs in `text` (a transcription).
 
     Accepts the full phrase within a sliding window (difflib ratio >= threshold)
     and, for phrases of the form "<greeting> <name>", the bare name if it is a
     close match - saying just "Zeta" should work too.
+
+    The bare name only counts in a short utterance (`bare_name_max_words`). In the middle of
+    a sentence a lone "zeta" is far more often the decoder's own bias leaking through than
+    someone calling out, and requiring the greeting there costs nothing.
     """
     words = normalize_words(text)
     target = normalize_words(phrase)
@@ -60,15 +92,20 @@ def phrase_matches(text: str, phrase: str, *, threshold: float = 0.78) -> bool:
     n = len(target)
     joined_target = " ".join(target)
     for i in range(0, max(1, len(words) - n + 1)):
-        window = " ".join(words[i:i + n])
+        chunk = words[i:i + n]
+        if n > 1 and chunk[0] in _FUNCTION_WORDS:
+            continue
+        window = " ".join(chunk)
         if difflib.SequenceMatcher(None, window, joined_target).ratio() >= threshold:
             return True
+    if bare_name_max_words and len(words) > bare_name_max_words:
+        return False
     name = target[-1]
-    variants = set(_ALIASES.get(name, [])) | {name}
+    variants = (set(_ALIASES.get(name, [])) | {name}) - _AMBIGUOUS
     for w in words:
         if w in variants:
             return True
-        if len(w) >= 4 and difflib.SequenceMatcher(None, w, name).ratio() >= 0.85:
+        if len(w) >= 4 and w not in _AMBIGUOUS and difflib.SequenceMatcher(None, w, name).ratio() >= 0.88:
             return True
     return False
 
@@ -90,8 +127,8 @@ class WakeEngine:
 class WhisperPhraseEngine(WakeEngine):
     name = "whisper"
 
-    def __init__(self, phrase: str, model_size: str = "tiny", window_seconds: float = 2.5, min_speech_ms: int = 300,
-                 silence_ms: int = 450):
+    def __init__(self, phrase: str, model_size: str = "tiny", window_seconds: float = 2.5, min_speech_ms: int = 400,
+                 silence_ms: int = 450, sensitivity: float = 0.5):
         import numpy as np  # noqa: F401  (validated at construction)
         from faster_whisper import WhisperModel
 
@@ -106,6 +143,16 @@ class WhisperPhraseEngine(WakeEngine):
         self.speech_frames = 0
         self.silent_frames = 0
         self.in_speech = False
+        # One dial, WAKE_WORD_SENSITIVITY: 0 = only an unmistakable "hey zeta", 1 = eager.
+        # A tiny Whisper model will confidently write words for a fan or a cough, so each of
+        # these is a separate reason to throw a candidate away.
+        sens = min(1.0, max(0.0, sensitivity))
+        self.energy_floor = 700.0 - 400.0 * sens        # RMS a frame needs before it counts as speech
+        self.match_threshold = 0.86 - 0.10 * sens       # how close the words have to be
+        self.no_speech_max = 0.20 + 0.55 * sens         # Whisper's own "there was no speech here"
+        self.logprob_min = -0.45 - 1.05 * sens          # ...and its confidence in what it wrote
+        self.rejected = 0                               # candidates thrown away (shown in status)
+        self.last_rejected = ""
 
     def _rms(self, frame) -> float:
         f = frame.astype(self.np.float32)
@@ -116,7 +163,7 @@ class WhisperPhraseEngine(WakeEngine):
         frame = frame.reshape(-1)
         self.buffer = np.concatenate([self.buffer, frame])[-self.window:]
         rms = self._rms(frame)
-        threshold = max(350.0, self.noise * 3.0)
+        threshold = max(self.energy_floor, self.noise * 3.0)
         if rms > threshold:
             self.in_speech = True
             self.speech_frames += 1
@@ -133,23 +180,51 @@ class WhisperPhraseEngine(WakeEngine):
                 return None
             audio = self.buffer.astype(np.float32) / 32768.0
             try:
-                # Bias decoding towards the phrase (small models otherwise mis-hear "Zeta" as "either", "theta"...).
-                kwargs: Dict[str, Any] = dict(language="en", beam_size=2, vad_filter=False, condition_on_previous_text=False,
-                                              without_timestamps=True, initial_prompt=f"{self.phrase.title()}. {self.phrase.title()}.")
+                # Whisper's own VAD runs first: on room noise it returns no segments at all, which
+                # is the cheapest way not to hallucinate a wake word. Decoding is greedy at
+                # temperature 0 so it cannot get creative. `hotwords` nudges "Zeta" (small models
+                # otherwise write "either" or "theta"). An `initial_prompt` stuffed with the phrase
+                # used to live here as well, and that is precisely what made Zeta wake up on its
+                # own: given nothing to transcribe, the model repeats its prompt back.
+                kwargs: Dict[str, Any] = dict(language="en", beam_size=1, temperature=0.0,
+                                              condition_on_previous_text=False, without_timestamps=True,
+                                              no_speech_threshold=0.5, log_prob_threshold=-1.0, vad_filter=True,
+                                              vad_parameters={"min_speech_duration_ms": 200, "speech_pad_ms": 120})
                 try:
                     segments, _ = self.model.transcribe(audio, hotwords=self.phrase.title(), **kwargs)
                 except TypeError:  # older faster-whisper without `hotwords`
                     segments, _ = self.model.transcribe(audio, **kwargs)
-                text = " ".join(s.text for s in segments).strip()
+                segs = list(segments)
             except Exception as e:  # noqa: BLE001
                 log.debug("wake transcription failed: %s", e)
                 return None
-            if text:
-                log.debug("wake candidate: %r", text)
-            if text and phrase_matches(text, self.phrase):
+            text = " ".join(seg.text for seg in segs).strip()
+            if not text:
+                return None
+            reason = self._reject_reason(segs, text)
+            if reason:
+                self.rejected += 1
+                self.last_rejected = f"{text} ({reason})"
+                log.debug("wake candidate rejected: %r - %s", text, reason)
+                return None
+            log.debug("wake candidate: %r", text)
+            if phrase_matches(text, self.phrase, threshold=self.match_threshold):
                 self.buffer = np.zeros(0, dtype=np.int16)
                 return text
         return None
+
+    def _reject_reason(self, segs: list, text: str) -> str:
+        """Why this transcription should not count. An empty string means it is worth matching."""
+        if looks_hallucinated(text):
+            return "stock non-speech text"
+        no_speech = max((getattr(seg, "no_speech_prob", 0.0) or 0.0) for seg in segs)
+        if no_speech > self.no_speech_max:
+            return f"no_speech_prob {no_speech:.2f}"
+        logprobs = [getattr(seg, "avg_logprob", 0.0) or 0.0 for seg in segs]
+        avg = sum(logprobs) / len(logprobs)
+        if avg < self.logprob_min:
+            return f"avg_logprob {avg:.2f}"
+        return ""
 
 
 class OpenWakeWordEngine(WakeEngine):
@@ -226,7 +301,10 @@ class WakeWordService:
     def status(self) -> Dict[str, Any]:
         return {"enabled": self.enabled, "running": self.running, "engine": self._engine.name if self._engine else self.engine_name,
                 "phrase": self.phrase, "error": self.error, "detections": self.detections, "last_text": self.last_text,
-                "last_detection": self.last_detection}
+                "last_detection": self.last_detection, "sensitivity": self.sensitivity,
+                "rejected": getattr(self._engine, "rejected", 0),
+                "last_rejected": getattr(self._engine, "last_rejected", ""),
+                "muted_for": max(0.0, round(self.paused_until - time.monotonic(), 1))}
 
     # ---- internals -----------------------------------------------------
     def _build_engine(self) -> WakeEngine:
@@ -241,7 +319,7 @@ class WakeWordService:
                 if want == "openwakeword":
                     raise RuntimeError(f"openwakeword unavailable: {e}. Run: pip install openwakeword") from e
         try:
-            return WhisperPhraseEngine(self.phrase)
+            return WhisperPhraseEngine(self.phrase, sensitivity=self.sensitivity)
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"wake word needs faster-whisper + numpy: {e}. Run: pip install faster-whisper numpy sounddevice") from e
 

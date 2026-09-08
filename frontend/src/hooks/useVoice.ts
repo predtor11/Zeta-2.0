@@ -208,7 +208,13 @@ export function useVoice(o: Options): VoiceState {
       } catch {
         /* analyser unavailable: play without levels */
       }
-      api.wakePause(Math.min(90, 4 + text.length / 12)).catch(() => undefined);
+      // Deafen the wake word listener for exactly as long as this clip plays, so Zeta never
+      // hears itself. `duration` is only known once metadata has loaded; until then use a
+      // speaking-rate estimate, and top it up when the real length arrives.
+      const deafen = (seconds: number) => api.wakePause(Math.min(120, seconds + 2.5)).catch(() => undefined);
+      deafen(Math.min(90, 2 + text.length / 12));
+      if (Number.isFinite(a.duration) && a.duration > 0) deafen(a.duration);
+      else a.onloadedmetadata = () => Number.isFinite(a.duration) && deafen(a.duration);
       setSpeaking(true);
       await new Promise<void>((resolve) => {
         a.onended = () => resolve();

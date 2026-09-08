@@ -38,7 +38,8 @@ class ChatterboxTTS(TTSProvider):
 
     def __init__(self, base_url: str = "http://127.0.0.1:8766", voice: str = "", model: str = "turbo",
                  device: str = "auto", exaggeration: float = 0.5, cfg_weight: float = 0.5,
-                 temperature: float = 0.8, autostart: bool = True, startup_timeout: float = 180.0):
+                 temperature: float = 0.8, autostart: bool = True, startup_timeout: float = 180.0,
+                 idle_unload: float = 60.0):
         self.base_url = (base_url or "http://127.0.0.1:8766").rstrip("/")
         self.voice = voice
         self.model = model
@@ -48,6 +49,7 @@ class ChatterboxTTS(TTSProvider):
         self.temperature = temperature
         self.autostart = autostart
         self.startup_timeout = startup_timeout
+        self.idle_unload = idle_unload
         self._process: Optional[subprocess.Popen] = None
         self._starting: Optional[asyncio.Task] = None
 
@@ -116,7 +118,8 @@ class ChatterboxTTS(TTSProvider):
         # running from an earlier session. Use it rather than fighting over the port.
         mine = self._process is not None and self._process.poll() is None
         if not mine and not await self._reachable():
-            cmd = [str(VENV_PYTHON), "-u", str(SERVER), "--model", self.model, "--device", self.device]
+            cmd = [str(VENV_PYTHON), "-u", str(SERVER), "--model", self.model, "--device", self.device,
+                   "--idle-unload", str(self.idle_unload)]
             if self.voice:
                 cmd += ["--voice", self.voice]
             log.info("Starting the Chatterbox voice server: %s", " ".join(cmd[1:]))
@@ -152,6 +155,20 @@ class ChatterboxTTS(TTSProvider):
         except Exception:  # noqa: BLE001
             return False
 
+    async def release_gpu(self) -> bool:
+        """Ask the voice to hand its VRAM back now, without waiting for the idle timer.
+
+        On an 8 GB laptop card the voice (~2 GB) and a local 8B model do not both fit, and a
+        model that spills onto the CPU runs about ten times slower. Zeta calls this before a
+        long generation so the LLM gets the whole card.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.post(f"{self.base_url}/park")
+            return bool(r.status_code < 400 and r.json().get("parked"))
+        except Exception:  # noqa: BLE001
+            return False
+
     def stop(self) -> None:
         """Only stops a server this process started; a manually launched one is left alone."""
         if self._process and self._process.poll() is None:
@@ -170,7 +187,10 @@ class ChatterboxTTS(TTSProvider):
                                                                       f"(start_tts.bat)"}
         if not h.get("ok"):
             return {"ok": False, "detail": h.get("error") or "model loading"}
-        return {"ok": True, "detail": f"{h.get('model')} on {h.get('device')}, voice {h.get('voice')}", **h}
+        where = h.get("device")
+        if h.get("parked"):
+            where = f"{where}, parked in RAM"      # the VRAM is currently the LLM's
+        return {"ok": True, "detail": f"{h.get('model')} on {where}, voice {h.get('voice')}", **h}
 
     async def voices(self) -> list:
         try:
