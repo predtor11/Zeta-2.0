@@ -1,0 +1,24 @@
+# Optional capabilities. Install what you need:
+#   pip install -r requirements-optional.txt
+#
+# Voice (local speech-to-text). Requires a CPU/GPU build of ctranslate2.
+faster-whisper>=1.0.3
+# Run Whisper on an NVIDIA GPU (about 12x faster than the CPU). Windows DLL paths are handled for you.
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12
+# Screen interaction (mouse/keyboard control)
+pyautogui>=0.9.54
+# OS credential store for secrets (SecretStore backend "keyring")
+keyring>=25.2.0
+# Document text extraction for content indexing
+pypdf>=4.2.0
+python-docx>=1.1.2
+openpyxl>=3.1.2
+
+# Wake word ("Hey Zeta"): microphone capture + the whisper phrase engine (needs faster-whisper above)
+sounddevice>=0.4.7
+numpy>=1.26
+# Cheaper wake-word engine with pretrained models (hey_jarvis...) or your own trained model
+# openwakeword>=0.6.0
+# PostgreSQL / Supabase database backend (DATABASE_URL=postgresql://...)
+asyncpg>=0.29.0

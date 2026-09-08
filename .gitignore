@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env / secrets
+.env
+backend/.env
+*.pem
+*.key
+backend/config/permissions.local.yaml
+backend/config/contacts.json
+
+# Data / logs
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+backend/data/
+backend/logs/
+browser_profiles/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Desktop
+desktop/src-tauri/target/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local voice (Chatterbox): its own environment and any reference recordings
+.venv-tts/
+voice/*.wav
+!voice/README.md

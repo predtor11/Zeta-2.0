@@ -1,0 +1,4 @@
+[
+  {"name": "Rahul", "phone": "+91 98765 43210", "email": "rahul@example.com", "aliases": ["rahul sharma"]},
+  {"name": "Project Manager", "phone": "", "email": "pm@example.com", "aliases": ["pm", "manager"]}
+]

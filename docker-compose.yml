@@ -1,0 +1,61 @@
+# Zeta in containers (CLOUD MODE).
+#
+# Only the API/UI run in Docker.  Host-computer tools (apps, clipboard, screenshots,
+# open_file, power) are disabled automatically in cloud mode because a container
+# cannot control the host desktop.  For full local control run Zeta natively
+# (install.bat) - see docs/DEPLOYMENT.md "host-agent architecture".
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend
+    environment:
+      ZETA_MODE: cloud
+      HOST: 0.0.0.0
+      PORT: 8765
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      LLM_MODEL: ${LLM_MODEL:-llama3.1}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DATA_DIR: /data
+      LOGS_DIR: /logs
+      FS_ALLOWED_ROOTS: /workspace
+      FS_INDEX_ROOTS: /workspace
+      BROWSER_HEADLESS: "true"
+      TERMINAL_SHELL: bash
+    volumes:
+      - zeta-data:/data
+      - zeta-logs:/logs
+      - ./workspace:/workspace
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Optional local model server (start with: docker compose --profile ollama up).
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    profiles: ["ollama"]
+
+volumes:
+  zeta-data:
+  zeta-logs:
+  ollama:
