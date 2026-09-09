@@ -14,6 +14,7 @@ and the TTS layer uses to pick a delivery.
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -25,6 +26,43 @@ from app.emotion.state import LABELS, EmotionState, clamp, nearest_label
 
 log = logging.getLogger(__name__)
 
+
+
+# Verbs that mean "do this", as opposed to "here is how I am feeling". A tired person asking
+# for their database client still wants their database client.
+_ACTION_VERBS = (
+    "open|launch|start|run|execute|play|pause|resume|close|quit|stop|kill|restart|"
+    "find|search|look up|google|show|list|read|write|edit|create|make|build|generate|"
+    "delete|remove|rename|copy|move|save|download|upload|install|update|uninstall|"
+    "send|email|message|text|call|reply|forward|schedule|remind|book|"
+    "set|turn|switch|enable|disable|mute|unmute|increase|decrease|"
+    "click|type|press|screenshot|browse|navigate|go to|take|check|tell me|give me"
+)
+# "open chrome", "please open chrome", "can you open chrome", "i need you to open chrome"
+_ACTION_RE = re.compile(
+    r"^\s*(?:hey\s+\w+[,\s]+)?"
+    r"(?:(?:can|could|will|would|do)\s+(?:you|u)\s+(?:please\s+)?|"
+    r"(?:i\s+(?:want|need|would like)\s+(?:you\s+)?to\s+)|"
+    r"(?:please\s+)|(?:let\'s\s+)|(?:just\s+))?"
+    rf"(?:{_ACTION_VERBS})\b",
+    re.I,
+)
+
+
+def asks_for_action(text: str) -> bool:
+    """Is this someone asking Zeta to do something, rather than telling it how they are?
+
+    Deliberately shallow: it only has to separate "open my email" from "work has been rough".
+    Anything it is unsure about falls through to the emotional reading, which is the safer
+    default - the cost of a missed action request is one apologetic reply, and the cost of a
+    missed emotional cue is worse.
+    """
+    if not text:
+        return False
+    for clause in re.split(r"[.!?;\n]+|,\s+(?=and\s+)", text.strip())[:3]:
+        if _ACTION_RE.match(clause.strip()):
+            return True
+    return False
 
 class EmotionEngine:
     """Stateful per-user emotion tracking. Cheap, local, and always explainable."""
@@ -207,11 +245,17 @@ class EmotionEngine:
         return out
 
     # ------------------------------------------------------------------ prompt
-    def prompt_note(self, state: Optional[EmotionState] = None) -> str:
-        """The emotional context handed to the model for this turn."""
+    def prompt_note(self, state: Optional[EmotionState] = None, message: str = "") -> str:
+        """The emotional context handed to the model for this turn.
+
+        `message` matters: "open MySQL Workbench" said in a flat voice is a request, not a
+        confession. Leading with acknowledgement there produces the one reply nobody wants -
+        sympathy, and the app still closed.
+        """
         state = state or self.current
         if not self.enabled or state.confidence < 0.22 and not state.crisis:
             return ""
+        wants_action = asks_for_action(message)
         lines = [f"How they seem right now: {state.describe()}."]
         tr = self.trend()
         if tr.get("samples", 0) >= 3 and tr["direction"] != "steady":
@@ -220,7 +264,11 @@ class EmotionEngine:
             sig = crisis_mod.CrisisSignal(state.crisis["level"], state.crisis.get("matched", []),
                                           state.crisis.get("resources", []))
             lines.append(sig.guidance())
-        elif state.needs_support and self.support_mode:
+        elif state.needs_support and wants_action:
+            # They asked for something. Do it; the mood only softens the wording.
+            lines.append("They have asked you to do something - do it. A short warm clause is welcome, "
+                         "but carry out the request in the same turn.")
+        elif state.needs_support and self.support_mode and (state.intensity >= 0.4 or state.confidence >= 0.6):
             lines.append("Lead with acknowledgement before anything practical. Keep it short, warm and specific; "
                          "do not perform sympathy or pile on questions.")
         elif state.needs_support:

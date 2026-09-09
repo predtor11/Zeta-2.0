@@ -39,7 +39,7 @@ class ChatterboxTTS(TTSProvider):
     def __init__(self, base_url: str = "http://127.0.0.1:8766", voice: str = "", model: str = "turbo",
                  device: str = "auto", exaggeration: float = 0.5, cfg_weight: float = 0.5,
                  temperature: float = 0.8, autostart: bool = True, startup_timeout: float = 180.0,
-                 idle_unload: float = 60.0):
+                 idle_unload: float = 300.0):
         self.base_url = (base_url or "http://127.0.0.1:8766").rstrip("/")
         self.voice = voice
         self.model = model
@@ -155,19 +155,29 @@ class ChatterboxTTS(TTSProvider):
         except Exception:  # noqa: BLE001
             return False
 
-    async def release_gpu(self) -> bool:
+    async def release_gpu(self) -> Dict[str, Any]:
         """Ask the voice to hand its VRAM back now, without waiting for the idle timer.
 
         On an 8 GB laptop card the voice (~2 GB) and a local 8B model do not both fit, and a
         model that spills onto the CPU runs about ten times slower. Zeta calls this before a
         long generation so the LLM gets the whole card.
+
+        Returns `{"free": bool, "busy": bool, "parked": bool}`. `free` is the one that matters:
+        the VRAM is available, either because the model just moved or because it was never on
+        the GPU. `busy` means a sentence is being generated right now and the weights must not
+        move - the caller should wait rather than load anything.
         """
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.post(f"{self.base_url}/park")
-            return bool(r.status_code < 400 and r.json().get("parked"))
+            if r.status_code >= 400:
+                return {"free": False, "busy": False, "parked": False}
+            h = r.json()
         except Exception:  # noqa: BLE001
-            return False
+            return {"free": True, "busy": False, "parked": False}   # no voice server: nothing holds VRAM
+        holding = h.get("holding_device") or ""
+        return {"free": bool(h.get("parked") or holding == "cpu" or not holding),
+                "busy": bool(h.get("busy")), "parked": bool(h.get("parked"))}
 
     def stop(self) -> None:
         """Only stops a server this process started; a manually launched one is left alone."""

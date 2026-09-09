@@ -256,6 +256,69 @@ single thing that decides whether Zeta feels instant or unusable.
 `HF_ENDPOINT=https://hf-mirror.com` before starting the server. `HF_HUB_DISABLE_XET=1` also avoids a
 Windows transfer bug.
 
+## Sharing one GPU
+
+Zeta wants the same graphics card three times: Ollama to think, Chatterbox to speak,
+faster-whisper to listen. On a 24 GB desktop card this section does not matter. On an 8 GB
+laptop card it decides whether Zeta answers in four seconds or four minutes.
+
+The failure is silent, which is what makes it worth documenting. **Ollama does not report that a
+model did not fit** - it moves the leftover layers to the CPU and carries on at roughly a tenth of
+the speed. Everything looks configured correctly; replies just take minutes and eventually time out.
+
+Measured on an RTX 4070 Laptop (8188 MB, ~720 MB of it taken by Windows and a live wallpaper):
+
+| What | VRAM | Speed |
+|---|---|---|
+| `qwen3:8b` @ `num_ctx=16384` | 7450 MB - **1456 MB of it on the CPU** | replies took 180-228 s, then timed out |
+| `qwen3:8b` @ `num_ctx=8192` | 5900 MB, all on the GPU | 39.7 tok/s; turns in 4-9 s |
+| `qwen3:4b` @ `num_ctx=8192` | 3694 MB | 62.8 tok/s |
+| Chatterbox Turbo, speaking | ~2000 MB | 0.4-0.5x realtime (5-8 s a sentence) |
+| Chatterbox Turbo, speaking while the LLM holds the card | - | **0.1x realtime (57 s for a 5 s clip)** |
+| Chatterbox Turbo on the CPU | 0 | 0.1x realtime (20 s a sentence) - not usable |
+| faster-whisper `small` on the GPU | ~900 MB | 0.6 s an utterance |
+| faster-whisper `small` on the CPU | 0 | 7.1 s an utterance |
+
+Two conclusions from that table. **Nothing except Whisper is worth moving to the CPU** - the voice
+is as slow there as it is when starved of VRAM, and the language model on the CPU *is* the bug. And
+`LLM_CONTEXT_LENGTH` is the single most important setting on a small card: 16k costs 1550 MB more
+than 8k, and that is exactly the margin that decides whether anything fits.
+
+### How Zeta shares it
+
+A reply is thought first and spoken afterwards, so the two big models never truly need the card at
+the same instant. Zeta hands it over rather than letting either one spill:
+
+* Before a turn, the voice is **parked**: its weights move to system RAM and the VRAM is released.
+  Coming back costs about 4.6 s and happens while Zeta is already generating.
+* Before speaking, the language model is **unloaded** (`keep_alive: 0`) if it would crowd the voice
+  out. It reloads on the next turn.
+* Never mid-turn: a task that is still running will want the model again in a moment.
+
+`GPU_SHARE=auto` (the default) decides by measurement, not by guesswork: Zeta compares the model's
+real footprint - from `/api/ps`, whatever model you configured - against the card, and only takes
+turns when the two genuinely do not fit. Put a model on that leaves room for the voice and the
+handover switches itself off, which the startup log says out loud:
+
+```
+qwen3:4b loaded: 3693 MB on the GPU, 168 MB VRAM free. The voice fits alongside it, so both stay loaded.
+qwen3:8b does not fit on the GPU: 1456 MB of 7450 MB is running on the CPU, which makes replies
+  roughly ten times slower. Free VRAM, or lower LLM_CONTEXT_LENGTH.
+```
+
+`GET /api/system/status` reports the same under `gpu`: total, free, whether Zeta is arbitrating, and
+where the model's weights actually are. `CHATTERBOX_IDLE_UNLOAD` (default 300 s) is only a safety
+net for a long silence - Zeta parks the voice itself before each turn when it needs to.
+
+### Which model to run on 8 GB
+
+`qwen3:8b` at 8k context is the default: it fits, and it answers cleanly. `qwen3:4b` is tempting -
+2.2 GB smaller, 1.6x faster, and small enough that the handover switches off entirely - but as
+measured here it calls tools correctly and then writes its reasoning out as the reply ("Okay, the
+user is asking for the current time. Let me check the tools available…"), which Zeta would say out
+loud. `think: false` does not suppress it. If you want to try a smaller brain, a non-thinking
+instruct variant is the thing to test, not the hybrid.
+
 ## ElevenLabs models: speed vs expression
 
 `ELEVENLABS_MODEL` decides how a reply is *performed*. All three work on a free key.

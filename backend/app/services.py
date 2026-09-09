@@ -42,8 +42,11 @@ from app.tools.terminal import TerminalService
 from app.core import gpu
 from app.voice.wakeword import WakeWordService
 
-VOICE_VRAM_MB = 2400   # what Chatterbox needs on the GPU, measured on an RTX 4070 Laptop
-SMALL_GPU_MB = 12288   # at or below this, the voice and an 8B model cannot both be resident
+VOICE_VRAM_MB = 2400    # what Chatterbox needs on the GPU, measured on an RTX 4070 Laptop
+DESKTOP_VRAM_MB = 800   # what Windows, the browser and a live wallpaper take before Zeta starts
+SMALL_GPU_MB = 12288    # fallback guess before the model's real size is known
+PARK_ATTEMPTS = 8       # a sentence takes a few seconds; wait it out rather than load into a full card
+PARK_RETRY_SECONDS = 2.0
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +57,11 @@ class ZetaServices:
     def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or get_settings()
         self.started = False
+        self._llm_vram_mb = 0        # measured footprint of the language model; 0 until it loads once
+        self._rewarm: Optional[asyncio.Task] = None
+        # One owner of the graphics card at a time. Without it, a queued spoken reply can resume
+        # the voice in the middle of a turn's model load - both end up half on the CPU.
+        self._gpu_lock = asyncio.Lock()
         self.audio_cache: Dict[str, Tuple[bytes, str]] = {}
         self._build()
 
@@ -112,7 +120,7 @@ class ZetaServices:
                                       reply, enabled=self.settings.emotion_adapt_voice)
 
     # ------------------------------------------------------------------ sharing one GPU
-    async def balance_gpu(self, want: str) -> None:
+    async def balance_gpu(self, want: str) -> bool:
         """Make room on the GPU for whichever of the two big models is about to run.
 
         Ollama needs about 6 GB for an 8B model and Chatterbox about 2 GB. On an 8 GB laptop
@@ -122,15 +130,14 @@ class ZetaServices:
         actually need the card at the same time - so Zeta hands it over explicitly.
 
         Only small cards pay for this. With plenty of VRAM both models stay resident.
+        Returns whether the card is now clear for `want` - the caller should not load a model
+        into VRAM that something else is still holding.
         """
         if not self._gpu_shared():
-            return
+            return True                       # both fit: nothing to hand over
         try:
             if want == "llm":
-                # Parking is a no-op if the voice is already parked, so this is cheap to call.
-                release = getattr(self.tts, "release_gpu", None)
-                if release and await release():
-                    log.info("Voice parked so the language model gets the whole GPU.")
+                return await self._park_voice()
             elif want == "voice" and not self.tasks.active():
                 # Measured on an RTX 4070 Laptop: speaking with the language model still resident
                 # takes 57s for a 5s clip, because Chatterbox spills into shared memory. With the
@@ -142,23 +149,100 @@ class ZetaServices:
                 if unload and await unload():
                     log.info("Language model unloaded so the voice can speak on the GPU "
                              "(it reloads on the next turn).")
+            return True
         except Exception as e:  # noqa: BLE001
             log.debug("gpu handover (%s) failed: %s", want, e)
+            return False
+
+    async def _park_voice(self) -> bool:
+        """Get the voice off the GPU, waiting out a sentence it is in the middle of.
+
+        Loading the language model while the voice still holds its ~2 GB is the whole failure
+        this class of bug is about: it does not error, it just puts a slice of the model on the
+        CPU and takes minutes. Better to wait a few seconds for a sentence to finish.
+        """
+        release = getattr(self.tts, "release_gpu", None)
+        if not release:
+            return True                       # a voice that owns no VRAM (ElevenLabs, Windows TTS)
+        for _ in range(PARK_ATTEMPTS):
+            state = await release()
+            if isinstance(state, bool):       # a provider with the older signature
+                return state
+            if state.get("parked"):
+                log.info("Voice parked so the language model gets the whole GPU.")
+                return True
+            if state.get("free"):
+                return True                   # already parked, or never on the GPU
+            if not state.get("busy"):
+                return False
+            await asyncio.sleep(PARK_RETRY_SECONDS)   # mid-sentence: it will be done shortly
+        log.warning("The voice is still using the GPU; the language model may not fit.")
+        return False
 
     def _gpu_shared(self) -> bool:
-        """Should Zeta arbitrate the GPU? Automatic on a card too small to hold both models."""
+        """Should Zeta arbitrate the GPU, or can both models simply stay resident?
+
+        Handing the card back and forth costs a model reload on the next turn, so it is only
+        worth doing when the two genuinely do not fit together. Rather than guess from the card
+        size, this compares the language model's measured footprint (whatever model is
+        configured) against the card, and a smaller model turns the whole mechanism off by
+        itself - which is the better fix, when it is available.
+        """
         mode = (self.settings.gpu_share or "auto").lower()
         if mode in ("off", "false", "no"):
             return False
         mem = gpu.gpu_memory()
         if not mem:
             return False                     # no NVIDIA GPU: nothing to hand over
-        return mode == "on" or mem[0] < SMALL_GPU_MB
+        if mode == "on":
+            return True
+        total = mem[0]
+        if not self._llm_vram_mb:            # not measured yet: fall back to the card size
+            return total < SMALL_GPU_MB
+        return total < self._llm_vram_mb + VOICE_VRAM_MB + DESKTOP_VRAM_MB
 
     async def synthesize(self, text: str):
-        """Speak `text` in the current emotional delivery, GPU handover included."""
-        await self.balance_gpu("voice")
-        return await self.tts.synthesize(text, self.speech_style(text))
+        """Speak `text` in the current emotional delivery, GPU handover included.
+
+        The card is held for the whole generation: a turn starting underneath this would load its
+        model into VRAM the voice is about to take back.
+        """
+        style = self.speech_style(text)
+        async with self._gpu_lock:
+            await self.balance_gpu("voice")
+            audio = await self.tts.synthesize(text, style)
+        self._rewarm_llm_soon()
+        return audio
+
+    def _rewarm_llm_soon(self) -> None:
+        """Put the language model back on the GPU while the reply is still being listened to.
+
+        Speaking evicts it, so without this the *next* thing the person says waits 15-20 s for a
+        reload. The audio has just been generated but not yet played, which is several seconds of
+        the person's attention going spare - exactly enough to load a model in. If they interrupt
+        during it, the reload was going to happen anyway.
+        """
+        if not (self._gpu_shared() and self.started):
+            return
+        if self._rewarm and not self._rewarm.done():
+            return
+        warm = getattr(self.llm, "warm", None)
+        if not warm:
+            return
+
+        async def run() -> None:
+            try:
+                async with self._gpu_lock:
+                    if not await self.balance_gpu("llm"):
+                        return      # the voice is still speaking; the next turn will try again
+                    self._note_llm_size(await warm())
+            except Exception as e:  # noqa: BLE001
+                log.debug("could not re-warm the language model: %s", e)
+
+        try:
+            self._rewarm = asyncio.get_running_loop().create_task(run())
+        except RuntimeError:
+            pass
 
     def _build_wake(self, s: Settings) -> WakeWordService:
         return WakeWordService(enabled=bool(s.wake_word_enabled and s.is_local), phrase=s.wake_word, engine=s.wake_word_engine,
@@ -238,23 +322,34 @@ class ZetaServices:
         warm = getattr(self.llm, "warm", None)
         if not warm:
             return
-        await self.balance_gpu("llm")
         try:
-            placement = await warm()
+            async with self._gpu_lock:
+                await self.balance_gpu("llm")
+                placement = await warm()
         except Exception as e:  # noqa: BLE001
             log.debug("could not preload the language model: %s", e)
             return
+        self._note_llm_size(placement)
         if placement.get("on_cpu"):
             log.warning("%s does not fit on the GPU: %d MB of %d MB is running on the CPU, which makes replies "
                         "roughly ten times slower. Free VRAM, or lower LLM_CONTEXT_LENGTH.",
                         self.settings.llm_model, placement["cpu_mb"], placement["total_mb"])
         elif placement.get("vram_mb"):
-            log.info("%s loaded: %d MB on the GPU, %d MB VRAM free.", self.settings.llm_model,
-                     placement["vram_mb"], gpu.free_mb())
+            log.info("%s loaded: %d MB on the GPU, %d MB VRAM free.%s", self.settings.llm_model,
+                     placement["vram_mb"], gpu.free_mb(),
+                     "" if self._gpu_shared() else " The voice fits alongside it, so both stay loaded.")
+
+    def _note_llm_size(self, placement: Dict[str, Any]) -> None:
+        """Remember how big this model really is; it decides whether the handover is needed."""
+        size = int(placement.get("total_mb") or 0)
+        if size:
+            self._llm_vram_mb = max(self._llm_vram_mb, size)
 
     async def stop(self) -> None:
         self.tasks.cancel_all("server shutting down")
         self.confirmations.cancel_all()
+        if self._rewarm and not self._rewarm.done():
+            self._rewarm.cancel()
         self.wake.stop()
         try:
             self.tts.stop()          # stops a voice server this process started
@@ -327,7 +422,8 @@ class ZetaServices:
             self.tasks.set_status(task, TaskStatus.COMPLETED, result=reply, message=reply)
             event_bus.publish("assistant_message", task_id=task.id, conversation_id=conversation_id, content=reply)
             return task
-        await self.balance_gpu("llm")
+        async with self._gpu_lock:
+            await self.balance_gpu("llm")
         task = self.tasks.create(message, conversation_id)
         self.tasks.start(task, self.orchestrator.run(task, message))
         if wait:
@@ -381,6 +477,7 @@ class ZetaServices:
         if placement:
             try:
                 out["llm"] = await placement()
+                self._note_llm_size(out["llm"])
             except Exception:  # noqa: BLE001
                 pass
         return out

@@ -427,7 +427,7 @@ def main() -> None:
     ap.add_argument("--model", default=os.getenv("CHATTERBOX_MODEL", "turbo"), choices=["turbo", "base", "multilingual"])
     ap.add_argument("--device", default=os.getenv("CHATTERBOX_DEVICE", "auto"), choices=["auto", "cuda", "cpu"])
     ap.add_argument("--voice", default=os.getenv("CHATTERBOX_VOICE", ""), help="reference .wav for the voice (empty = built-in)")
-    ap.add_argument("--idle-unload", type=float, default=float(os.getenv("CHATTERBOX_IDLE_UNLOAD", "60")),
+    ap.add_argument("--idle-unload", type=float, default=float(os.getenv("CHATTERBOX_IDLE_UNLOAD", "300")),
                     help="seconds of silence before the model is parked in system RAM and the VRAM handed back "
                          "(0 = keep it on the GPU always)")
     args = ap.parse_args()

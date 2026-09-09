@@ -140,7 +140,7 @@ class Settings(BaseSettings):
     chatterbox_cfg_weight: float = 0.5    # lower = slower, more deliberate pacing
     chatterbox_temperature: float = 0.8
     chatterbox_autostart: bool = True     # start the voice server on first use if it is not already running
-    chatterbox_idle_unload: float = 60.0  # seconds of silence before the voice hands its VRAM back to the LLM (0 = never)
+    chatterbox_idle_unload: float = 300.0  # safety-net timer; Zeta parks the voice itself before each turn (0 = never)
     gpu_share: str = "auto"               # auto | on | off. On a small card, let the voice and the LLM take turns
 
     # ---- Emotional intelligence -------------------------------------

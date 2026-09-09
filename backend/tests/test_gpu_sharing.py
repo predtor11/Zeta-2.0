@@ -141,3 +141,108 @@ async def test_gpu_share_off_is_respected(svc, monkeypatch):
 
     await svc.balance_gpu("llm")
     assert not called
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_fits_alongside_the_voice_turns_the_handover_off(svc, monkeypatch):
+    """The best fix for a small card is a smaller model, and Zeta should notice by itself.
+
+    qwen3:8b measures 5900 MB, which leaves no room for the voice on an 8 GB card, so the two
+    take turns. A 4B model measures around 3300 MB and both stay resident - no handover, and
+    no model reload on the turn after Zeta speaks.
+    """
+    monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
+    monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+
+    svc._note_llm_size({"total_mb": 5900})
+    assert svc._gpu_shared()
+
+    svc._llm_vram_mb = 0
+    svc._note_llm_size({"total_mb": 3300})
+    assert not svc._gpu_shared()
+
+
+@pytest.mark.asyncio
+async def test_the_measured_size_only_ever_grows(svc):
+    """A reading taken while the model is still loading must not make Zeta over-optimistic."""
+    svc._llm_vram_mb = 0
+    svc._note_llm_size({"total_mb": 5900})
+    svc._note_llm_size({"total_mb": 120})       # caught mid-load
+    assert svc._llm_vram_mb == 5900
+
+
+@pytest.mark.asyncio
+async def test_the_model_reloads_while_the_reply_is_being_spoken(svc, monkeypatch):
+    """Speaking evicts the model; without this the next question pays 15-20 s for the reload."""
+    monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
+    monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    svc._note_llm_size({"total_mb": 5900})
+    warmed = []
+
+    async def warm():
+        warmed.append(True)
+        return {"total_mb": 5900, "vram_mb": 5900}
+
+    monkeypatch.setattr(svc.llm, "warm", warm, raising=False)
+    monkeypatch.setattr(svc.tts, "synthesize", lambda *a, **k: _wav(), raising=False)
+
+    await svc.synthesize("Tokyo is the capital of Japan.")
+    assert svc._rewarm is not None
+    await svc._rewarm
+    assert warmed
+
+
+async def _wav():
+    return b"RIFF", "audio/wav"
+
+
+@pytest.mark.asyncio
+async def test_no_rewarm_when_both_models_already_fit(svc, monkeypatch):
+    monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (24576, 18000))
+    monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    monkeypatch.setattr(svc.tts, "synthesize", lambda *a, **k: _wav(), raising=False)
+
+    await svc.synthesize("Nothing to hand over here.")
+    assert svc._rewarm is None
+
+
+@pytest.mark.asyncio
+async def test_zeta_waits_for_a_sentence_instead_of_loading_into_a_full_card(svc, monkeypatch):
+    """The bug this prevents: parking failed because the voice was mid-sentence, Zeta loaded the
+    model anyway, part of it landed on the CPU and the turn timed out after 182 s."""
+    monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
+    monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    monkeypatch.setattr("app.services.PARK_RETRY_SECONDS", 0.0)
+    calls = []
+
+    async def release():
+        calls.append(1)
+        return {"free": False, "busy": True, "parked": False} if len(calls) < 3 \
+            else {"free": True, "busy": False, "parked": True}
+
+    monkeypatch.setattr(svc.tts, "release_gpu", release, raising=False)
+    assert await svc.balance_gpu("llm") is True
+    assert len(calls) == 3          # waited out two busy replies rather than barging in
+
+
+@pytest.mark.asyncio
+async def test_a_voice_that_never_frees_the_card_is_reported_not_ignored(svc, monkeypatch):
+    monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
+    monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    monkeypatch.setattr("app.services.PARK_RETRY_SECONDS", 0.0)
+
+    async def release():
+        return {"free": False, "busy": True, "parked": False}
+
+    monkeypatch.setattr(svc.tts, "release_gpu", release, raising=False)
+    assert await svc.balance_gpu("llm") is False
+
+
+@pytest.mark.asyncio
+async def test_a_voice_that_owns_no_vram_never_blocks_a_turn(svc, monkeypatch):
+    """ElevenLabs and the Windows voices have no release_gpu; a turn must not wait on them."""
+    monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
+    monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    monkeypatch.delattr(type(svc.tts), "release_gpu", raising=False)
+    monkeypatch.setattr(svc.tts, "release_gpu", None, raising=False)
+    assert await svc.balance_gpu("llm") is True

@@ -313,3 +313,72 @@ def test_support_mode_off_keeps_zeta_task_first():
     note = e.prompt_note(e.analyze("i feel quite sad about it"))
     assert "get on with what they asked for" in note
     assert EMOTIONAL_INTELLIGENCE
+
+
+# --------------------------------------------------------------- mood must not block action
+# Real fault: a prosody-only "tired" reading (confidence 0.5, intensity 0.29) put Zeta into
+# support mode, and "Open MySQL Workbench" got "I'm sorry you're having trouble. Let me try to
+# open it for you." - with no tool call. Emotion changes the wording, never whether Zeta acts.
+import pytest as _pytest
+
+from app.emotion.engine import asks_for_action
+
+
+@_pytest.mark.parametrize("text", [
+    "Open MySQL Workbench and open any database on it.",
+    "Can you open gtf5 for me, the application in the games folder",
+    "please launch whatsapp",
+    "hey zeta, open chrome and search for the weather",
+    "i need you to find my tax file",
+    "take a screenshot",
+    "close spotify",
+])
+def test_requests_to_do_something_are_recognised(text):
+    assert asks_for_action(text)
+
+
+@_pytest.mark.parametrize("text", [
+    "work has been really rough today",
+    "i am so tired of all of this",
+    "i feel like nothing i do ever works",
+    "it takes a lot out of me",
+    "how are you today?",
+])
+def test_someone_sharing_how_they_feel_is_not_a_request(text):
+    assert not asks_for_action(text)
+
+
+def _tired():
+    from app.emotion.state import EmotionState
+
+    return EmotionState(label="tired", valence=-0.22, arousal=0.145, confidence=0.5, intensity=0.287,
+                        cues=["quieter than usual", "hesitant, long pauses"])
+
+
+def test_a_low_mood_does_not_stop_zeta_opening_an_app():
+    from app.emotion.engine import EmotionEngine
+
+    eng = EmotionEngine(enabled=True, use_prosody=True, region="in", support_mode=True)
+    note = eng.prompt_note(_tired(), "Open MySQL Workbench and open any database on it.")
+    assert "asked you to do something - do it" in note
+    assert "Lead with acknowledgement before anything practical" not in note
+
+
+def test_real_distress_still_gets_the_support_lead():
+    from app.emotion.engine import EmotionEngine
+    from app.emotion.state import EmotionState
+
+    eng = EmotionEngine(enabled=True, use_prosody=True, region="in", support_mode=True)
+    sad = EmotionState(label="sad", valence=-0.7, arousal=0.2, confidence=0.75, intensity=0.62,
+                       cues=["flat, quiet delivery"])
+    assert "Lead with acknowledgement" in eng.prompt_note(sad, "i feel like nothing i do ever works")
+
+
+def test_a_faint_reading_no_longer_hijacks_the_reply():
+    """confidence 0.5 / intensity 0.29 is a hint, not a reason to lead with sympathy."""
+    from app.emotion.engine import EmotionEngine
+
+    eng = EmotionEngine(enabled=True, use_prosody=True, region="in", support_mode=True)
+    note = eng.prompt_note(_tired(), "work has been rough")
+    assert "Lead with acknowledgement before anything practical" not in note
+    assert "get on with what they asked for" in note

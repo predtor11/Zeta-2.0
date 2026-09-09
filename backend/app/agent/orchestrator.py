@@ -124,7 +124,7 @@ class Orchestrator:
                 # A voice turn was already analysed with its audio; reuse it instead of re-reading the words alone.
                 state: EmotionState = self.emotion.take_staged(message) or self.emotion.analyze_text(message)
                 self.emotion.record(state, conversation_id=task.conversation_id, task_id=task.id)
-                emotion_note = self.emotion.prompt_note(state)
+                emotion_note = self.emotion.prompt_note(state, message)
                 if state.confidence >= 0.3 or state.crisis:
                     event_bus.publish("emotion", task_id=task.id, conversation_id=task.conversation_id,
                                       emotion=state.to_dict(), trend=self.emotion.trend())
