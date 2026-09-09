@@ -52,6 +52,10 @@ export function endsWithQuestion(text: string): boolean {
  * microphone capture (with live level + optional silence auto-stop), transcription,
  * spoken replies with an output analyser, wake-word triggers and "listen again after a question".
  */
+// Deafen the wake word listener for as long as Zeta is talking, so it never hears itself.
+// Pauses only ever extend on the backend, so an over-estimate is free and an under-estimate is not.
+const deafen = (seconds: number) => api.wakePause(Math.min(120, seconds + 2.5)).catch(() => undefined);
+
 export function useVoice(o: Options): VoiceState {
   const [recording, setRecording] = useState(false);
   const [mode, setMode] = useState<ListenMode>("manual");
@@ -74,6 +78,8 @@ export function useVoice(o: Options): VoiceState {
   const micTimer = useRef<number>(0);
   const outTimer = useRef<number>(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const speechRef = useRef(0);                                   // bumped to cancel the reply being spoken
+  const abortRef = useRef<AbortController | null>(null);
   const spokenRef = useRef<string | null>(null);
   const lastWake = useRef(o.wakeSignal);
   const lastInputVoice = useRef(false);
@@ -89,6 +95,9 @@ export function useVoice(o: Options): VoiceState {
   };
 
   const stopSpeaking = useCallback(() => {
+    speechRef.current += 1;        // anything still playing or being fetched belongs to an older reply
+    abortRef.current?.abort();
+    abortRef.current = null;
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
@@ -184,50 +193,86 @@ export function useVoice(o: Options): VoiceState {
     [stop, stopSpeaking],
   );
 
+  const playClip = useCallback(async (blob: Blob, live: () => boolean) => {
+    const url = URL.createObjectURL(blob);
+    const a = new Audio(url);
+    audioRef.current = a;
+    try {
+      const ctx = audioCtx();
+      const src = ctx.createMediaElementSource(a);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      analyser.connect(ctx.destination);
+      const buf = new Float32Array(analyser.fftSize);
+      window.clearInterval(outTimer.current);
+      outTimer.current = window.setInterval(() => {
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        levels.current.out = Math.min(1, Math.sqrt(sum / buf.length) * 6);
+      }, 50);
+    } catch {
+      /* analyser unavailable: play without levels */
+    }
+    // `duration` is only known once metadata has loaded; the caller has already deafened for a
+    // rate estimate, this just tops it up with the real length.
+    if (Number.isFinite(a.duration) && a.duration > 0) deafen(a.duration);
+    else a.onloadedmetadata = () => Number.isFinite(a.duration) && deafen(a.duration);
+    await new Promise<void>((resolve) => {
+      a.onended = () => resolve();
+      a.onerror = () => resolve();
+      a.onpause = () => resolve();
+      a.play().catch(() => resolve());
+    });
+    URL.revokeObjectURL(url);
+    if (audioRef.current === a && live()) audioRef.current = null;
+  }, []);
+
+  // Speak a reply piece by piece.
+  //
+  // The voice returns nothing until a whole clip is finished, so a long answer used to be a long
+  // silence - measured on this machine at roughly 40 ms per character, i.e. ~16 s before the first
+  // word of a 400-character reply. The backend splits the reply into sentences; each piece is
+  // requested while the previous one is playing, so the wait is only ever for the first sentence.
   const speak = useCallback(
     async (text: string) => {
       if (!optsRef.current.ttsEnabled || !text.trim()) return;
       stopSpeaking();
-      const blob = await api.speak(text.slice(0, 2500));
-      const a = new Audio(URL.createObjectURL(blob));
-      audioRef.current = a;
+      const token = ++speechRef.current;
+      const live = () => speechRef.current === token;
+
+      let segments: string[] = [];
       try {
-        const ctx = audioCtx();
-        const src = ctx.createMediaElementSource(a);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 512;
-        src.connect(analyser);
-        analyser.connect(ctx.destination);
-        const buf = new Float32Array(analyser.fftSize);
-        outTimer.current = window.setInterval(() => {
-          analyser.getFloatTimeDomainData(buf);
-          let sum = 0;
-          for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-          levels.current.out = Math.min(1, Math.sqrt(sum / buf.length) * 6);
-        }, 50);
+        segments = (await api.speakPlan(text)).segments;
       } catch {
-        /* analyser unavailable: play without levels */
+        segments = [text];              // planning failed: speak it in one go, as before
       }
-      // Deafen the wake word listener for exactly as long as this clip plays, so Zeta never
-      // hears itself. `duration` is only known once metadata has loaded; until then use a
-      // speaking-rate estimate, and top it up when the real length arrives.
-      const deafen = (seconds: number) => api.wakePause(Math.min(120, seconds + 2.5)).catch(() => undefined);
+      if (!segments.length || !live()) return;
+
+      const ac = new AbortController();
+      abortRef.current = ac;
+      const fetchPiece = (i: number) =>
+        api
+          .speak(segments[i], { lead: i === 0, final: i === segments.length - 1, signal: ac.signal })
+          .catch(() => null);
+
       deafen(Math.min(90, 2 + text.length / 12));
-      if (Number.isFinite(a.duration) && a.duration > 0) deafen(a.duration);
-      else a.onloadedmetadata = () => Number.isFinite(a.duration) && deafen(a.duration);
       setSpeaking(true);
-      await new Promise<void>((resolve) => {
-        a.onended = () => resolve();
-        a.onerror = () => resolve();
-        a.onpause = () => resolve();
-        a.play().catch(() => resolve());
-      });
+      let pending = fetchPiece(0);
+      for (let i = 0; i < segments.length; i++) {
+        const blob = await pending;
+        pending = i + 1 < segments.length ? fetchPiece(i + 1) : Promise.resolve(null);
+        if (!blob || !live()) break;
+        await playClip(blob, live);
+      }
+      if (!live()) return;              // a newer reply took over; it owns the state now
       window.clearInterval(outTimer.current);
       levels.current.out = 0;
-      if (audioRef.current === a) audioRef.current = null;
+      abortRef.current = null;
       setSpeaking(false);
     },
-    [stopSpeaking],
+    [stopSpeaking, playClip],
   );
 
   // New assistant reply: speak it, then listen again if it ended with a question.

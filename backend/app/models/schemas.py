@@ -148,7 +148,9 @@ class SetupRequest(BaseModel):
 
 
 class SpeakRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=5000)
+    text: str = Field(min_length=1, max_length=20000)   # a whole reply for /speak/plan; one piece for /speak
+    lead: bool = True     # first piece of the reply: the only one that may open with a sigh/breath
+    final: bool = True    # last piece: the only one after which the language model is reloaded
 
 
 class ScheduleCreate(BaseModel):

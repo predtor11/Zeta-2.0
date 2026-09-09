@@ -39,7 +39,7 @@ class ChatterboxTTS(TTSProvider):
     def __init__(self, base_url: str = "http://127.0.0.1:8766", voice: str = "", model: str = "turbo",
                  device: str = "auto", exaggeration: float = 0.5, cfg_weight: float = 0.5,
                  temperature: float = 0.8, autostart: bool = True, startup_timeout: float = 180.0,
-                 idle_unload: float = 300.0):
+                 idle_unload: float = 300.0, language: str = ""):
         self.base_url = (base_url or "http://127.0.0.1:8766").rstrip("/")
         self.voice = voice
         self.model = model
@@ -50,6 +50,8 @@ class ChatterboxTTS(TTSProvider):
         self.autostart = autostart
         self.startup_timeout = startup_timeout
         self.idle_unload = idle_unload
+        self.language = (language or "").strip().lower()   # "" = detect from the text
+        self._warned_language = False
         self._process: Optional[subprocess.Popen] = None
         self._starting: Optional[asyncio.Task] = None
         self._client: Optional[httpx.AsyncClient] = None
@@ -83,12 +85,28 @@ class ChatterboxTTS(TTSProvider):
                 "cfg_weight": float(p.get("cfg_weight", self.cfg_weight)),
                 "temperature": float(p.get("temperature", self.temperature))}
 
-    # ------------------------------------------------------------------ speaking
-    async def synthesize(self, text: str, style: Any = None) -> Tuple[bytes, str]:
-        from app.emotion.speech import prepare
+    def _language(self, spoken: str) -> str:
+        """Which language to speak this in. Configured wins; otherwise the script decides.
 
-        body = {"text": prepare(text, style, self.speech_model) if style is not None else text,
-                "voice": self.voice, **self._params(style)}
+        Only the `multilingual` model can do anything with this - the server ignores it for
+        turbo and base, which are English-only. Say so once rather than letting an English
+        model mangle Devanagari in silence.
+        """
+        from app.emotion.speech import language_of
+
+        lang = self.language or language_of(spoken)
+        if lang and lang != "en" and self.model != "multilingual" and not self._warned_language:
+            self._warned_language = True
+            log.warning("This reply is in %r but CHATTERBOX_MODEL=%s speaks English only. "
+                        "Set CHATTERBOX_MODEL=multilingual to speak it properly.", lang, self.model)
+        return lang
+
+    # ------------------------------------------------------------------ speaking
+    async def synthesize(self, text: str, style: Any = None, lead: bool = True) -> Tuple[bytes, str]:
+        from app.emotion.speech import for_voice, language_of, prepare
+
+        spoken = prepare(text, style, self.speech_model, lead) if style is not None else for_voice(text)
+        body = {"text": spoken, "voice": self.voice, "language": self._language(spoken), **self._params(style)}
         try:
             data = await self._post(body)
         except (httpx.ConnectError, httpx.ReadError):

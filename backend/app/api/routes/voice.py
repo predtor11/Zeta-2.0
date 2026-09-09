@@ -16,6 +16,10 @@ from app.services import ZetaServices
 
 router = APIRouter(prefix="/api/voice", tags=["voice"], dependencies=[Depends(require_auth)])
 
+# Zeta will read out an essay if you let it. At ~40 ms a character that is several minutes of
+# talking, and nobody listens to the end. Long answers are read to here and left on screen.
+MAX_SPEECH_CHARS = 4000
+
 
 def _audio_seconds(data: bytes, mime: str) -> float:
     """How long this clip plays for, read out of the WAV header (0.0 if it is not a WAV)."""
@@ -71,11 +75,31 @@ async def transcribe(file: UploadFile = File(...), language: str = Form(""), svc
 @router.post("/speak")
 async def speak(req: SpeakRequest, svc: ZetaServices = Depends(services)):
     try:
-        data, mime = await svc.synthesize(req.text)
+        data, mime = await svc.synthesize(req.text, lead=req.lead, final=req.final)
     except ZetaError as e:
         raise HTTPException(503, e.user_message)
     _deafen_while_speaking(svc, data, mime, req.text)
     return Response(content=data, media_type=mime)
+
+
+@router.post("/speak/plan")
+async def speak_plan(req: SpeakRequest):
+    """Split a reply into pieces that can be spoken one after another.
+
+    The voice generates a whole clip before it returns anything, so a 400-character answer is
+    about 16 seconds of silence on this machine. The UI asks for the pieces, then requests them
+    in order and plays each one while the next is still being made - so the first words arrive
+    in a few seconds regardless of how long the answer is.
+
+    Splitting happens here rather than in the browser because it has to agree with what the
+    voice actually receives: Markdown removed first, so "**Done.**" does not become a sentence
+    boundary in one place and not the other.
+    """
+    from app.emotion.speech import segments, strip_markdown
+
+    spoken = strip_markdown(req.text)[:MAX_SPEECH_CHARS]
+    pieces = segments(spoken)
+    return {"segments": pieces, "truncated": len(strip_markdown(req.text)) > MAX_SPEECH_CHARS}
 
 
 @router.get("/audio/{audio_id}")

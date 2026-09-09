@@ -48,12 +48,17 @@ VOICE_DIR = ROOT / "voice"
 
 log = logging.getLogger("chatterbox-server")
 
-# Paralinguistic tags Chatterbox Turbo performs. Anything else is stripped before
+# Paralinguistic tags Chatterbox Turbo actually performs. Anything else is stripped before
 # generation so a stray "[warmly]" is never read out as a word.
-TAGS = {"laugh", "laughs", "chuckle", "chuckles", "giggle", "giggles", "sigh", "sighs",
-        "gasp", "gasps", "cough", "coughs", "sniff", "clears throat", "breath", "whisper"}
+#
+# Checked by synthesizing "[tag] That is a shame..." and transcribing the result with Whisper:
+# sigh, chuckle, laugh, gasp, sniff and cough come back as sound with no extra words, while
+# breath, giggle, whisper and "clears throat" come back as "Breath. That is a shame..." - the
+# voice reads the tag out. Those four are deliberately absent.
+TAGS = {"laugh", "laughs", "chuckle", "chuckles", "sigh", "sighs",
+        "gasp", "gasps", "cough", "coughs", "sniff", "sniffs"}
 _TAG_RE = re.compile(r"\[([a-z][a-z ']{1,24})\]", re.I)
-_SENT_RE = re.compile(r"(?<=[.!?…])\s+")
+_SENT_RE = re.compile(r"(?<=[.!?…।])\s+")     # danda too, so Hindi splits into sentences as well
 MAX_CHARS = 280          # Chatterbox degrades on very long inputs; split on sentences instead
 
 
@@ -63,6 +68,18 @@ def clean_text(text: str) -> str:
         return m.group(0) if m.group(1).strip().lower() in TAGS else " "
 
     return re.sub(r"\s{2,}", " ", _TAG_RE.sub(take, text)).strip()
+
+
+def gap_after(piece: str) -> float:
+    """How long to wait before the next chunk, in seconds.
+
+    Chunks are generated separately and glued together, so whatever silence goes between them
+    is the pause the listener hears. A fixed gap after every sentence is exactly the metronome
+    that makes a voice sound synthetic; real speech pauses longer after a question than after a
+    comma. These are hand-picked, not measured - there is no ground truth to measure against.
+    """
+    end = piece.rstrip()[-1:] if piece.strip() else ""
+    return {"?": 0.30, "!": 0.26, ".": 0.20, "…": 0.34, "।": 0.22, ",": 0.09, ":": 0.16, ";": 0.16}.get(end, 0.12)
 
 
 def chunks(text: str, limit: int = MAX_CHARS) -> List[str]:
@@ -293,7 +310,7 @@ class Engine:
                 wav = self.model.generate(part, **self._supported(kwargs))
                 audio = wav.detach().cpu().numpy() if isinstance(wav, torch.Tensor) else np.asarray(wav)
                 pieces.append(audio.reshape(-1))
-                pieces.append(np.zeros(int(self.sr * 0.12), dtype=audio.dtype))   # breath between sentences
+                pieces.append(np.zeros(int(self.sr * gap_after(part)), dtype=audio.dtype))
             self.last_used = time.time()
         joined = np.concatenate(pieces[:-1]) if len(pieces) > 1 else pieces[0]
         return to_wav(joined, self.sr)

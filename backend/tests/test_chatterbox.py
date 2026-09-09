@@ -72,17 +72,49 @@ def test_upset_is_spoken_slower_and_calmer_than_delighted():
     assert calm["exaggeration"] < happy["exaggeration"]
 
 
-def test_tag_dialect_is_translated_for_chatterbox():
+class _Dice:
+    """A loaded die, so a probabilistic sound can be tested at all."""
+
+    def __init__(self, value: float):
+        self.value = value
+
+    def random(self) -> float:
+        return self.value
+
+
+def _sound(monkeypatch, on: bool) -> None:
+    monkeypatch.setattr(speech, "_rng", _Dice(0.0 if on else 1.0))
+
+
+def test_tag_dialect_is_translated_for_chatterbox(monkeypatch):
+    _sound(monkeypatch, on=False)
     style = speech.STYLES["warm"]
     assert speech.prepare("[laughs] nice", style, "chatterbox") == "[laugh] nice"
     assert speech.prepare("[warmly] hello", style, "chatterbox") == "hello"      # mood tags are dropped
     assert speech.prepare("[sighs] fine", style, "chatterbox") == "[sigh] fine"
 
 
-def test_only_one_cue_per_reply():
-    playful = speech.STYLES["playful"]                     # its lead tag is "laughs"
+def test_only_one_cue_per_reply(monkeypatch):
+    _sound(monkeypatch, on=True)
+    playful = speech.STYLES["playful"]                     # its sound is a chuckle
     assert speech.prepare("[sighs] oh well", playful, "chatterbox") == "[sigh] oh well"
-    assert speech.prepare("oh well", playful, "chatterbox") == "[laugh] oh well"
+    assert speech.prepare("oh well", playful, "chatterbox") == "[chuckle] oh well"
+
+
+def test_the_same_sound_is_not_made_every_single_time(monkeypatch):
+    """A little sigh before every gentle reply is more obviously synthetic than no sigh at all."""
+    gentle = speech.STYLES["gentle"]
+    _sound(monkeypatch, on=True)
+    assert speech.prepare("that's rough", gentle, "chatterbox").startswith("[sigh]")
+    _sound(monkeypatch, on=False)
+    assert speech.prepare("that's rough", gentle, "chatterbox") == "that's rough"
+
+
+def test_only_the_first_piece_of_a_reply_opens_with_a_sound(monkeypatch):
+    """Streaming speaks a reply in pieces; sighing at the start of each one would be absurd."""
+    _sound(monkeypatch, on=True)
+    gentle = speech.STYLES["gentle"]
+    assert speech.prepare("and then this", gentle, "chatterbox", lead=False) == "and then this"
 
 
 def test_chatterbox_is_expressive_and_advertises_its_tags():
@@ -124,7 +156,8 @@ async def test_defaults_are_used_when_no_emotion_is_known(monkeypatch):
 
     monkeypatch.setattr(tts, "_post", fake_post)
     await tts.synthesize("hello")
-    assert sent == {"text": "hello", "voice": "", "exaggeration": 0.42, "cfg_weight": 0.44, "temperature": 0.8}
+    assert sent == {"text": "hello", "voice": "", "language": "", "exaggeration": 0.42, "cfg_weight": 0.44,
+                    "temperature": 0.8}
 
 
 @pytest.mark.asyncio

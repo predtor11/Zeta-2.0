@@ -84,7 +84,16 @@ export const api = {
     fd.append("file", blob, "audio.webm");
     return req<{ text: string; emotion?: EmotionReading | null }>("/api/voice/transcribe", { method: "POST", body: fd });
   },
-  speak: async (text: string): Promise<Blob> => req<Blob>("/api/voice/speak", { method: "POST", body: JSON.stringify({ text }) }),
+  // A reply is spoken in pieces so playback can start before the whole clip exists.
+  // `lead` marks the first piece (the only one allowed to open with a breath or a sigh) and
+  // `final` the last (after which the backend puts the language model back on the GPU).
+  speakPlan: (text: string) => req<{ segments: string[]; truncated: boolean }>("/api/voice/speak/plan", { method: "POST", body: JSON.stringify({ text }) }),
+  speak: async (text: string, opts: { lead?: boolean; final?: boolean; signal?: AbortSignal } = {}): Promise<Blob> =>
+    req<Blob>("/api/voice/speak", {
+      method: "POST",
+      signal: opts.signal,
+      body: JSON.stringify({ text, lead: opts.lead ?? true, final: opts.final ?? true }),
+    }),
   emotion: () => req<EmotionStatus>("/api/emotion"),
   emotionHistory: (limit = 50, days = 14) => req<EmotionReading[]>(`/api/emotion/history?limit=${limit}&days=${days}`),
   emotionDaily: (days = 14) => req<{ days: EmotionDay[]; trend: EmotionTrend }>(`/api/emotion/daily?days=${days}`),

@@ -140,6 +140,7 @@ class Settings(BaseSettings):
     chatterbox_cfg_weight: float = 0.5    # lower = slower, more deliberate pacing
     chatterbox_temperature: float = 0.8
     chatterbox_autostart: bool = True     # start the voice server on first use if it is not already running
+    chatterbox_language: str = ""          # "" = detect from the reply (Devanagari -> Hindi); needs the multilingual model
     chatterbox_idle_unload: float = 300.0  # safety-net timer; Zeta parks the voice itself before each turn (0 = never)
     gpu_share: str = "auto"               # auto | on | off. On a small card, let the voice and the LLM take turns
 

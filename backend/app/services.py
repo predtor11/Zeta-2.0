@@ -212,17 +212,23 @@ class ZetaServices:
             return total_mb < SMALL_GPU_MB
         return total_mb < self._llm_vram_mb + VOICE_VRAM_MB + DESKTOP_VRAM_MB
 
-    async def synthesize(self, text: str):
+    async def synthesize(self, text: str, lead: bool = True, final: bool = True):
         """Speak `text` in the current emotional delivery, GPU handover included.
 
         The card is held for the whole generation: a turn starting underneath this would load its
         model into VRAM the voice is about to take back.
+
+        A long reply is spoken in pieces (see `/api/voice/speak/plan`). `lead` marks the first
+        piece - only that one opens with a breath or a sigh - and `final` marks the last, which
+        is the only point at which the language model is worth putting back on the card. Without
+        that, a six-sentence answer would park and reload the model six times.
         """
         style = self.speech_style(text)
         async with self._gpu_lock:
             await self.balance_gpu("voice")
-            audio = await self.tts.synthesize(text, style)
-        self._rewarm_llm_soon()
+            audio = await self.tts.synthesize(text, style, lead)
+        if final:
+            self._rewarm_llm_soon()
         return audio
 
     def _rewarm_llm_soon(self) -> None:

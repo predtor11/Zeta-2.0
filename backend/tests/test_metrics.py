@@ -179,11 +179,13 @@ async def test_sampling_stops_when_nobody_is_watching():
     """Left running, this would poll the hardware forever for a panel nobody has open."""
     import asyncio
 
-    s = metrics.Sampler(interval=0.05, idle_stop=0.15)
+    # Generous margins: a real reading takes real time (nvidia-smi, WMI), and under a loaded
+    # test run a 0.15 s idle window could elapse before the assertion below even ran.
+    s = metrics.Sampler(interval=0.2, idle_stop=1.5)
     try:
         await s.get()
         assert s._task is not None and not s._task.done()
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2.5)
         assert s._task.done()
     finally:
         s.stop()

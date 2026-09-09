@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 class DisabledTTS(TTSProvider):
     name = "disabled"
 
-    async def synthesize(self, text: str, style: Any = None) -> Tuple[bytes, str]:
+    async def synthesize(self, text: str, style: Any = None, lead: bool = True) -> Tuple[bytes, str]:
         raise ConfigurationError("Text-to-speech is disabled. Set TTS_PROVIDER=chatterbox, local, piper or elevenlabs.")
 
     async def health(self) -> Dict[str, Any]:
@@ -62,10 +62,10 @@ class LocalTTS(TTSProvider):
             f"$s.SetOutputToWaveFile('{out_file}'); $s.Speak($t); $s.Dispose()"
         )
 
-    async def synthesize(self, text: str, style: Any = None) -> Tuple[bytes, str]:
-        from app.emotion.speech import for_display
+    async def synthesize(self, text: str, style: Any = None, lead: bool = True) -> Tuple[bytes, str]:
+        from app.emotion.speech import for_voice
 
-        text = for_display(text)
+        text = for_voice(text)
         # Windows voices carry no emotion, but pace does a surprising amount of the work.
         rate = self.rate + {"gentle": -2, "steady": -2, "delighted": 2, "bright": 1, "playful": 1}.get(getattr(style, "name", ""), 0)
         rate = max(-10, min(10, rate))
@@ -119,10 +119,10 @@ class PiperTTS(TTSProvider):
         self.executable = executable
         self.model_path = model_path
 
-    async def synthesize(self, text: str, style: Any = None) -> Tuple[bytes, str]:
-        from app.emotion.speech import for_display
+    async def synthesize(self, text: str, style: Any = None, lead: bool = True) -> Tuple[bytes, str]:
+        from app.emotion.speech import for_voice
 
-        text = for_display(text)
+        text = for_voice(text)
         if not self.model_path:
             raise ConfigurationError("Set TTS_VOICE to the path of a piper .onnx voice model.")
         out_file = tempfile.mktemp(suffix=".wav")
@@ -176,15 +176,15 @@ class ElevenLabsTTS(TTSProvider):
     def speech_model(self) -> str:
         return self.model
 
-    async def synthesize(self, text: str, style: Any = None) -> Tuple[bytes, str]:
-        from app.emotion.speech import prepare
+    async def synthesize(self, text: str, style: Any = None, lead: bool = True) -> Tuple[bytes, str]:
+        from app.emotion.speech import for_voice, prepare
 
         if not self._api_key:
             raise ConfigurationError("ELEVENLABS_API_KEY is not set.")
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}"
         headers = {"xi-api-key": self._api_key, "Content-Type": "application/json", "Accept": "audio/mpeg"}
         settings = getattr(style, "settings", None) or {"stability": 0.5, "similarity_boost": 0.75}
-        payload = {"text": prepare(text, style, self.model) if style is not None else text,
+        payload = {"text": prepare(text, style, self.model, lead) if style is not None else for_voice(text),
                    "model_id": self.model, "voice_settings": settings}
         try:
             async with httpx.AsyncClient(timeout=60) as c:
@@ -228,7 +228,7 @@ def build_tts_provider(settings: Settings) -> TTSProvider:
         return ChatterboxTTS(settings.chatterbox_base_url, settings.chatterbox_voice, settings.chatterbox_model,
                              settings.chatterbox_device, settings.chatterbox_exaggeration, settings.chatterbox_cfg_weight,
                              settings.chatterbox_temperature, settings.chatterbox_autostart,
-                             idle_unload=settings.chatterbox_idle_unload)
+                             idle_unload=settings.chatterbox_idle_unload, language=settings.chatterbox_language)
     if p == TTSProviderName.LOCAL:
         return LocalTTS(settings.tts_voice, settings.tts_rate)
     if p == TTSProviderName.PIPER:

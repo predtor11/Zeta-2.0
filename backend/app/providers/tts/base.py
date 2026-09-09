@@ -14,8 +14,12 @@ class TTSProvider(ABC):
     name = "base"
 
     @abstractmethod
-    async def synthesize(self, text: str, style: Any = None) -> Tuple[bytes, str]:
-        """Speak `text`, optionally in the delivery chosen by the emotion engine. Returns (audio, mime)."""
+    async def synthesize(self, text: str, style: Any = None, lead: bool = True) -> Tuple[bytes, str]:
+        """Speak `text`, optionally in the delivery chosen by the emotion engine. Returns (audio, mime).
+
+        `lead` is False for every piece of a reply after the first, so a voice that opens with a
+        breath or a sigh does it once per answer rather than once per sentence.
+        """
 
     @property
     def expressive(self) -> bool:

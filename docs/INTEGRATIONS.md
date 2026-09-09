@@ -222,6 +222,7 @@ If you already have a server on that URL (a `start_tts.bat` window, say), Zeta u
 | `CHATTERBOX_BASE_URL` | Where the voice server listens (default `http://127.0.0.1:8766`) |
 | `CHATTERBOX_AUTOSTART` | Start the server on demand instead of requiring `start_tts.bat` |
 | `CHATTERBOX_EXAGGERATION` / `CHATTERBOX_CFG_WEIGHT` | Baseline emotion and pacing; the emotion engine overrides them per reply |
+| `CHATTERBOX_LANGUAGE` | `multilingual` only. Empty = detect from the reply (Devanagari means Hindi) |
 
 **Changing the voice.** Put a clean 7-15 second WAV of the voice you want in `voice/`, set
 `CHATTERBOX_VOICE=voice/your_clip.wav`, and restart the voice server. One speaker, no music, no echo.
@@ -243,6 +244,46 @@ card sits at ~55% and 28 W, because the model decodes one token at a time and Wi
 overhead dominates. `torch.compile` does not currently help (CUDA graphs break on the KV cache).
 If a reply needs to be spoken the instant it appears, keep ElevenLabs; if you want a free, private,
 unlimited voice that can be cloned, keep Chatterbox. Both stay configured; `TTS_PROVIDER` switches.
+
+**Long replies are spoken in pieces.** Chatterbox returns nothing until the whole clip is finished,
+so a paragraph used to be twenty seconds of silence. `POST /api/voice/speak/plan` splits a reply into
+sentence-sized pieces and the UI requests each one while the previous is playing. Measured on a
+340-character reply: **first word after 5.1 s instead of 20.5 s**, and generation runs at 1.7-2.2x
+realtime so it stays ahead of playback (18.4 s of audio for 9.5 s of compute). Replies longer than
+4000 characters are read up to there and left on screen.
+
+**Markdown is never read out.** Everything the voice speaks goes through `strip_markdown()` in
+`backend/app/emotion/speech.py`: `**bold**`, `` `code` ``, headings, bullets, tables, link URLs and
+emoji are removed, a fenced code block becomes the sentence "The code is on screen.", and a bare URL
+becomes "the link". Headings and bullets get a full stop so they do not run into the next line.
+
+**Sounds it can actually make.** The tags Chatterbox performs were measured, not taken from the
+documentation: synthesize `[tag] That is a shame...`, then transcribe the clip back with Whisper and
+see whether the tag comes back as a word.
+
+| Tag | Result |
+|-----|--------|
+| `[sigh]` `[chuckle]` `[laugh]` `[gasp]` `[sniff]` `[cough]` | performed - sound only, no extra words |
+| `[breath]` `[giggle]` `[whisper]` `[clears throat]` | **read out loud** ("Breath. That is a shame...") |
+
+So only the first row is allowed through; the rest are mapped to a neighbour or dropped. Zeta uses a
+sound at the start of a reply *sometimes* rather than always (25-60% depending on the mood) - the same
+little sigh before every gentle answer sounds more synthetic than no sigh at all - and only on the
+first piece of a streamed reply.
+
+**Speaking Hindi.** Two separate halves:
+
+* *Understanding* it works today. faster-whisper is multilingual (verified: `small` reports
+  `is_multilingual = True`), so leave `STT_LANGUAGE` empty and it detects the language per utterance.
+  It was previously pinned to `en`, which forced English out of Hindi speech.
+* *Speaking* it needs `CHATTERBOX_MODEL=multilingual`. Turbo is English-only: given
+  `नमस्ते, मैं ठीक हूँ। आप कैसे हैं?` it produced 16 s of audio that Whisper transcribes as
+  "Comeway. Comewood's lit-scar..." - it is not accented Hindi, it is nonsense. Zeta logs a warning
+  once if it is asked to speak a non-English reply on an English-only model.
+
+The wake word stays English (the phrase is "Hey Zeta"), and the language of a reply is detected from
+its script, so a Hindi answer is spoken as Hindi automatically once the multilingual model is set.
+Romanised Hinglish ("kya haal hai") is indistinguishable from English here and is left to the default.
 
 **Emotion.** Turbo ignores `exaggeration` and `cfg_weight`, so Zeta shapes its delivery through
 `temperature` there (steadier when you sound low, livelier when you sound happy). The `base` and
