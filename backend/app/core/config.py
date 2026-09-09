@@ -118,7 +118,8 @@ class Settings(BaseSettings):
     # ---- Voice -------------------------------------------------------
     stt_provider: STTProviderName = STTProviderName.DISABLED
     stt_model: str = "base"          # faster-whisper model size, or API model name
-    stt_language: str = ""           # empty = auto
+    stt_language: str = ""           # pin one language; empty = choose per utterance
+    stt_languages: str = ""          # narrow that choice, e.g. "en,hi"; empty = all 99
     stt_device: str = "auto"         # auto | cpu | cuda  (auto tries the GPU and falls back to CPU)
     stt_base_url: str = ""           # for openai-compatible STT
     stt_api_key: str = ""

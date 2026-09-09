@@ -95,9 +95,14 @@ def _enable_cuda_dlls() -> None:
 class WhisperSTT(STTProvider):
     name = "whisper"
 
-    def __init__(self, model_size: str = "base", language: str = "", device: str = "auto", compute_type: str = ""):
+    def __init__(self, model_size: str = "base", language: str = "", device: str = "auto", compute_type: str = "",
+                 languages: str = ""):
         self.model_size = model_size
         self.language = language or None
+        # Which languages this household actually speaks. Whisper otherwise picks from 99, and on
+        # a two-second utterance it will cheerfully return Welsh or Urdu; narrowing the choice to
+        # the ones that can really occur removes a whole class of nonsense transcripts.
+        self.languages = [c.strip().lower() for c in (languages or "").split(",") if c.strip()]
         self.device = (device or "auto").lower()
         self.compute_type = compute_type or ("float16" if self.device == "cuda" else "int8" if self.device == "cpu" else "default")
         self._model = None
@@ -119,6 +124,29 @@ class WhisperSTT(STTProvider):
             self.active_device = dev
         return self._model
 
+    def _detect(self, path: str) -> Optional[str]:
+        """Pick a language, but only from the ones that are actually spoken here.
+
+        `detect_language` hands back the probability of every language it knows, so restricting
+        the choice is just a matter of ignoring the ones not on the list rather than trusting its
+        top pick. Returns None when no list is configured, which leaves Whisper free to choose.
+        """
+        if not self.languages:
+            return None
+        if len(self.languages) == 1:
+            return self.languages[0]
+        try:
+            _, _, probs = self._model.detect_language(audio=path, vad_filter=True)
+        except Exception as e:  # noqa: BLE001
+            log.debug("language detection failed (%s); letting Whisper decide", e)
+            return None
+        allowed = {c: p for c, p in probs if c in self.languages}
+        if not allowed:
+            return self.languages[0]
+        best = max(allowed, key=allowed.get)
+        log.debug("language %s (%.2f) chosen from %s", best, allowed[best], ", ".join(self.languages))
+        return best
+
     @staticmethod
     def _is_gpu_error(e: Exception) -> bool:
         m = str(e).lower()
@@ -134,7 +162,8 @@ class WhisperSTT(STTProvider):
                 f.write(data)
                 path = f.name
             try:
-                segments, info = self._model.transcribe(path, language=language or self.language, vad_filter=True, beam_size=5)
+                lang = language or self.language or self._detect(path)
+                segments, info = self._model.transcribe(path, language=lang, vad_filter=True, beam_size=5)
                 return " ".join(s.text.strip() for s in segments).strip()
             finally:
                 try:
@@ -239,7 +268,8 @@ class ElevenLabsSTT(STTProvider):
 def build_stt_provider(settings: Settings) -> STTProvider:
     p = settings.stt_provider
     if p == STTProviderName.WHISPER:
-        return WhisperSTT(settings.stt_model or "base", settings.stt_language, settings.stt_device)
+        return WhisperSTT(settings.stt_model or "base", settings.stt_language, settings.stt_device,
+                          languages=settings.stt_languages)
     if p == STTProviderName.ELEVENLABS:
         return ElevenLabsSTT(settings.stt_api_key or settings.elevenlabs_api_key, settings.stt_model, settings.stt_language)
     if p == STTProviderName.OPENAI:

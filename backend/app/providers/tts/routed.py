@@ -1,14 +1,14 @@
 """Two Chatterbox voices, chosen by the language of the reply.
 
-Neither model is the right answer on its own, and both numbers were measured on this machine
-(RTX 4070 Laptop, 8 GB, nothing else on the card):
+Neither model is the right answer on its own. Measured on an RTX 4070 Laptop (8 GB) on the
+*same* 150-character English sentence, each model running alone - comparing different sentences
+flatters the slower model, because fixed overheads dominate a short one:
 
-* **Turbo** speaks English at 1.7-2.2x realtime - fast enough that Zeta can generate the next
-  sentence while the current one is playing, which is what makes streamed speech work. It
+* **Turbo** speaks English at 0.42x realtime (7.5-9.4 s of audio for 18-22 s of compute). It
   cannot say a word of Hindi: given Devanagari it produced 16 s of audio that transcribes back
   as "Comeway. Comewood's lit-scar...".
-* **Multilingual** says Hindi properly (Whisper detects `hi` at p=1.00) but runs at 0.37x, so
-  an English reply that took 9.5 s of compute takes about 50 s. Streaming falls apart.
+* **Multilingual** says Hindi properly (Whisper detects `hi` at p=1.00) but takes 33-38 s for
+  the same sentence - 0.17x realtime, about 2.4x turbo's cost per second of speech.
 
 So Zeta keeps both and picks per reply. Only one holds the graphics card at a time: before
 speaking, the other is parked into system RAM and comes back in 2-3 s when it is next needed.
@@ -18,6 +18,7 @@ language costs one resume, not a model load.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, Tuple
 
@@ -25,6 +26,9 @@ from app.providers.tts.base import TTSProvider
 from app.providers.tts.chatterbox import ChatterboxTTS
 
 log = logging.getLogger(__name__)
+
+PARK_ATTEMPTS = 8            # a sentence takes a few seconds; wait it out rather than barge in
+PARK_RETRY_SECONDS = 2.0
 
 
 class LanguageRoutedTTS(TTSProvider):
@@ -40,8 +44,8 @@ class LanguageRoutedTTS(TTSProvider):
 
         Detection is by script, so Devanagari goes to the multilingual voice and everything
         else stays on the fast one. Romanised Hinglish ("kya haal hai") reads as English here
-        and is spoken by turbo, which handles it passably - better, at least, than waiting
-        50 seconds for the multilingual model to say the same thing.
+        and is spoken by turbo, which handles it passably - and about twice as quickly as the
+        multilingual model would say the same sentence.
         """
         from app.emotion.speech import language_of
 
@@ -67,12 +71,31 @@ class LanguageRoutedTTS(TTSProvider):
     # ------------------------------------------------------------------ speaking
     async def synthesize(self, text: str, style: Any = None, lead: bool = True) -> Tuple[bytes, str]:
         voice = self.voice_for(text)
-        idle = self.other if voice is self.english else self.english
-        try:
-            await idle.release_gpu()      # only one of the two may hold the card
-        except Exception as e:  # noqa: BLE001
-            log.debug("could not park the %s voice: %s", idle.model, e)
+        await self._free_card(self.other if voice is self.english else self.english)
         return await voice.synthesize(text, style, lead)
+
+    async def _free_card(self, idle: ChatterboxTTS) -> bool:
+        """Wait for the other voice to hand the card back before loading into it.
+
+        Asking once and carrying on is not a small mistake. With both models resident an 8 GB
+        card runs out - measured at 84 MB free - and Windows silently moves the overflow into
+        shared system RAM rather than failing. Generation then falls off a cliff: turbo went
+        from 9 iterations a second to one every 106 seconds, which is indistinguishable from a
+        hang. So if the other voice is mid-sentence, wait for it; a sentence ends soon enough.
+        """
+        for _ in range(PARK_ATTEMPTS):
+            try:
+                state = await idle.release_gpu()
+            except Exception as e:  # noqa: BLE001
+                log.debug("could not reach the %s voice to park it: %s", idle.model, e)
+                return True                       # not running, so it is holding nothing
+            if state.get("free"):
+                return True
+            if not state.get("busy"):
+                return False                      # it will not move and is not speaking either
+            await asyncio.sleep(PARK_RETRY_SECONDS)
+        log.warning("The %s voice would not release the GPU; speaking anyway, which will be slow.", idle.model)
+        return False
 
     async def release_gpu(self) -> Dict[str, Any]:
         """Hand the card back for a language-model turn: both voices, not just the busy one."""

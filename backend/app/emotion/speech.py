@@ -221,13 +221,17 @@ def language_of(text: str) -> str:
 _SENT_END = re.compile(r"(?<=[.!?…।])[\s\n]+")
 
 
-def segments(text: str, first_limit: int = 160, limit: int = 300) -> List[str]:
+def segments(text: str, first_limit: int = 100, limit: int = 300) -> List[str]:
     """Split a reply into pieces that can be spoken one after another.
 
     The voice generates a whole clip before returning anything, so a long answer means a
     long silence. Splitting lets playback start after the first sentence while the rest is
-    still being made. The first piece is deliberately short - it is the one the person is
-    waiting on - and later pieces are longer, because fewer joins means better prosody.
+    still being made.
+
+    The first piece is deliberately short, because it is the only one the person actually
+    waits for: at the measured 0.42x realtime, 100 characters costs about 16 s against 25 s
+    for 160. Later pieces are longer, because fewer joins means better prosody, and by then
+    the wait is hidden behind whatever is already playing.
     """
     words = _SENT_END.split(text.strip()) if text.strip() else []
     out: List[str] = []

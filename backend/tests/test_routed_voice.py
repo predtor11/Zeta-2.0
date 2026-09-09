@@ -1,9 +1,9 @@
 """Two voices, one graphics card: picking the right one per reply.
 
 Measured on an RTX 4070 Laptop and the reason this exists at all: Chatterbox Turbo speaks
-English at 1.7-2.2x realtime but produces nonsense for Devanagari, while the multilingual
-model says Hindi correctly at 0.37x - too slow to stream an English reply. Routing per reply
-keeps English fast without giving up Hindi.
+English at 0.42x realtime but produces nonsense for Devanagari, while the multilingual model
+says Hindi correctly at 0.17x - about 2.4x the cost per second of speech, measured on the same
+sentence with each model alone. Routing per reply keeps English fast without giving up Hindi.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def test_hindi_goes_to_the_voice_that_can_say_it():
 
 def test_romanised_hinglish_is_not_sent_to_the_slow_voice():
     """"kya haal hai" is indistinguishable from English by script, and turbo handles it
-    passably - which beats waiting 50 seconds for the same sentence."""
+    passably - in about half the time the multilingual model would take."""
     assert _routed().voice_for("kya haal hai, sab theek?").model == "turbo"
 
 
@@ -144,3 +144,63 @@ async def test_a_second_voice_that_has_never_started_is_not_a_fault(monkeypatch)
     h = await r.health()
     assert h["ok"] is True
     assert "not started yet" in h["detail"]
+
+
+@pytest.mark.asyncio
+async def test_zeta_waits_rather_than_loading_into_a_full_card(monkeypatch):
+    """The failure this prevents, measured rather than imagined: with both models resident the
+    8 GB card had 84 MB free, Windows moved the overflow into shared system RAM, and turbo fell
+    from 9 iterations a second to one every 106 seconds."""
+    monkeypatch.setattr("app.providers.tts.routed.PARK_RETRY_SECONDS", 0.0)
+    r = _routed()
+    calls = []
+
+    async def release():
+        calls.append(1)
+        return ({"free": False, "busy": True, "parked": False} if len(calls) < 3
+                else {"free": True, "busy": False, "parked": True})
+
+    async def speak(text, style=None, lead=True):
+        return b"RIFF", "audio/wav"
+
+    monkeypatch.setattr(r.english, "release_gpu", release)
+    monkeypatch.setattr(r.other, "synthesize", speak)
+    await r.synthesize(HINDI)
+    assert len(calls) == 3            # waited out two busy sentences instead of barging in
+
+
+@pytest.mark.asyncio
+async def test_a_voice_that_never_frees_the_card_does_not_block_speech_forever(monkeypatch):
+    """Waiting is right; waiting indefinitely is not. Speech still happens, with a warning."""
+    monkeypatch.setattr("app.providers.tts.routed.PARK_RETRY_SECONDS", 0.0)
+    r = _routed()
+    spoke = []
+
+    async def stuck():
+        return {"free": False, "busy": True, "parked": False}
+
+    async def speak(text, style=None, lead=True):
+        spoke.append(text)
+        return b"RIFF", "audio/wav"
+
+    monkeypatch.setattr(r.english, "release_gpu", stuck)
+    monkeypatch.setattr(r.other, "synthesize", speak)
+    await r.synthesize(HINDI)
+    assert spoke == [HINDI]
+
+
+@pytest.mark.asyncio
+async def test_a_voice_server_that_is_not_running_holds_nothing(monkeypatch):
+    """The second voice starts lazily, so "connection refused" means the card is already free."""
+    monkeypatch.setattr("app.providers.tts.routed.PARK_RETRY_SECONDS", 0.0)
+    r = _routed()
+
+    async def refused():
+        raise OSError("connection refused")
+
+    async def speak(text, style=None, lead=True):
+        return b"RIFF", "audio/wav"
+
+    monkeypatch.setattr(r.other, "release_gpu", refused)
+    monkeypatch.setattr(r.english, "synthesize", speak)
+    assert await r.synthesize(ENGLISH) == (b"RIFF", "audio/wav")

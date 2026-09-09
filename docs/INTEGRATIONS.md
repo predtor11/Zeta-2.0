@@ -259,9 +259,10 @@ unlimited voice that can be cloned, keep Chatterbox. Both stay configured; `TTS_
 **Long replies are spoken in pieces.** Chatterbox returns nothing until the whole clip is finished,
 so a paragraph used to be twenty seconds of silence. `POST /api/voice/speak/plan` splits a reply into
 sentence-sized pieces and the UI requests each one while the previous is playing. Measured on a
-340-character reply: **first word after 5.1 s instead of 20.5 s**, and generation runs at 1.7-2.2x
-realtime so it stays ahead of playback (18.4 s of audio for 9.5 s of compute). Replies longer than
-4000 characters are read up to there and left on screen.
+340-character reply this roughly halves the wait for the first word. It does **not** make playback
+gapless: generation runs at about 0.42x realtime, so it cannot stay ahead of the audio and there is
+a pause between sentences on a long reply. It starts sooner, which is the part that is felt.
+Replies longer than 4000 characters are read up to there and left on screen.
 
 **Markdown is never read out.** Everything the voice speaks goes through `strip_markdown()` in
 `backend/app/emotion/speech.py`: `**bold**`, `` `code` ``, headings, bullets, tables, link URLs and
@@ -292,17 +293,20 @@ Hindi speech.
 
 Speaking it is the harder half, and neither model is the answer on its own. Measured here:
 
+Measured on the *same* 150-character English sentence with each model running alone - comparing
+different sentences flatters the slower model, because fixed overheads dominate a short one:
+
 | | Turbo | Multilingual |
 |---|---|---|
-| English | **1.7-2.2x realtime** | 0.37x realtime |
+| English | **0.42x realtime** (18-22 s) | 0.17x realtime (33-38 s) |
 | Hindi | 16 s of nonsense ("Comeway. Comewood's lit-scar...") | correct - Whisper detects `hi` at p=1.00 |
 | VRAM | ~2.0 GB | ~3.2 GB |
 | Performs `[laugh]`/`[chuckle]` | yes | **no - reads them out as words** |
 
-Turbo is fast enough to generate the next sentence while the current one plays, which is what makes
-streamed speech work; multilingual at 0.37x cannot keep up, so an English reply that costs 9.5 s of
-compute on turbo costs about 50 s. Making English pay that to get Hindi is a bad trade. Classifier-free
-guidance is not the cause, incidentally: `cfg_weight` 0.5, 0.3 and 0.0 all land at 0.35-0.39x.
+Multilingual costs about 2.4x turbo per second of speech, so making every English reply pay that to
+get Hindi is a bad trade. Classifier-free guidance is not the cause, incidentally - `cfg_weight` 0.5,
+0.3 and 0.0 all land within noise of each other. Neither model is fast enough to stay ahead of its own
+playback; this is a choice between "slow" and "slower", not between smooth and stuttering.
 
 So Zeta runs both and picks per reply, by the script the text is written in:
 

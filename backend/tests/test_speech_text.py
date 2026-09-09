@@ -75,8 +75,8 @@ def test_the_first_piece_is_the_short_one():
     text = " ".join(f"This is sentence number {i} and it runs on for a while." for i in range(12))
     pieces = speech.segments(text)
     assert len(pieces) > 2
-    assert len(pieces[0]) <= 160
-    assert max(len(p) for p in pieces[1:]) > 160
+    assert len(pieces[0]) <= 100
+    assert max(len(p) for p in pieces[1:]) > 100
     assert " ".join(pieces) == text          # nothing lost, nothing invented
 
 
