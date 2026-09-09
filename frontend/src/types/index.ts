@@ -243,3 +243,84 @@ export interface AuditEntry {
   success: boolean | null;
   duration_ms: number | null;
 }
+
+// ---------------------------------------------------------------- hardware monitor
+export interface CpuMetrics {
+  percent: number;
+  per_core: number[];
+  cores_logical: number;
+  cores_physical: number;
+  frequency: { current_mhz: number; max_mhz: number | null } | null;
+  temperature_c: number | null;
+  /** Why there is no temperature, when there is none. Empty when the reading worked. */
+  temperature_detail: string;
+}
+
+export interface MemoryMetrics {
+  used_mb: number;
+  total_mb: number;
+  percent: number;
+  available_mb: number;
+  swap_used_mb: number;
+  swap_total_mb: number;
+}
+
+export interface GpuProcess {
+  pid: number;
+  name: string;
+  /** Usually null on Windows: the WDDM driver does not report per-process VRAM. */
+  memory_mb: number | null;
+}
+
+export interface GpuMetrics {
+  present: boolean;
+  detail?: string;
+  name?: string;
+  utilization?: number | null;
+  memory_utilization?: number | null;
+  memory_used_mb?: number | null;
+  memory_total_mb?: number | null;
+  memory_percent?: number | null;
+  temperature_c?: number | null;
+  power_w?: number | null;
+  power_limit_w?: number | null;
+  clock_mhz?: number | null;
+  clock_max_mhz?: number | null;
+  fan_percent?: number | null;
+  processes?: GpuProcess[];
+}
+
+export interface DiskMetrics {
+  mount: string;
+  used_gb: number;
+  total_gb: number;
+  percent: number;
+}
+
+export interface ProcessRow {
+  pid: number;
+  name: string;
+  memory_mb: number;
+}
+
+/** What Zeta's own models are doing with the machine. */
+export interface ZetaFootprint {
+  sharing: boolean;
+  llm: { model: string; loaded?: boolean; total_mb?: number; vram_mb?: number; cpu_mb?: number; on_cpu?: boolean };
+  voice: { provider?: string; ok?: boolean; parked?: boolean | null; device?: string; detail?: string };
+  speech?: { model: string; device: string };
+}
+
+export interface SystemMetrics {
+  at: number;
+  uptime_s: number;
+  cpu: CpuMetrics;
+  memory: MemoryMetrics;
+  gpu: GpuMetrics;
+  disks: DiskMetrics[];
+  disk: { read_mb_s: number; write_mb_s: number } | null;
+  network: { down_mb_s: number; up_mb_s: number } | null;
+  battery: { percent: number; plugged: boolean; minutes_left: number | null } | null;
+  processes: ProcessRow[];
+  zeta: ZetaFootprint;
+}

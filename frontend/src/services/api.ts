@@ -1,4 +1,4 @@
-import type { ActivityEvent, AuditEntry, Confirmation, Conversation, DatabaseInfo, EmotionDay, EmotionReading, EmotionStatus, EmotionTrend, MemoryItem, OAuthState, Schedule, SetupStatus, SystemStatus, Task, ToolInfo, WakeStatus } from "../types";
+import type { ActivityEvent, AuditEntry, Confirmation, Conversation, DatabaseInfo, EmotionDay, EmotionReading, EmotionStatus, EmotionTrend, MemoryItem, OAuthState, Schedule, SetupStatus, SystemMetrics, SystemStatus, Task, ToolInfo, WakeStatus } from "../types";
 
 const TOKEN_KEY = "zeta_api_token";
 
@@ -93,6 +93,7 @@ export const api = {
   wakeStatus: () => req<WakeStatus>("/api/voice/wake"),
   wakePause: (seconds = 20) => req(`/api/voice/wake/pause?seconds=${seconds}`, { method: "POST" }),
   wakeTest: () => req("/api/voice/wake/test", { method: "POST" }),
+  metrics: () => req<SystemMetrics>("/api/system/metrics"),
 };
 
 export function wsUrl(): string {

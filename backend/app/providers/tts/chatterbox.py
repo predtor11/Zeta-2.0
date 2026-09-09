@@ -52,6 +52,19 @@ class ChatterboxTTS(TTSProvider):
         self.idle_unload = idle_unload
         self._process: Optional[subprocess.Popen] = None
         self._starting: Optional[asyncio.Task] = None
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def client(self) -> httpx.AsyncClient:
+        """One client, kept open.
+
+        Building an `AsyncClient` and a fresh TCP connection for every call costs 170-680 ms on
+        this machine - measured against 3-5 ms when the connection is reused. That was invisible
+        while this was only used for speaking; the monitoring panel polls `health()` every few
+        seconds and made it obvious.
+        """
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=httpx.Timeout(180.0, connect=3.0))
+        return self._client
 
     # ------------------------------------------------------------------ delivery
     @property
@@ -85,8 +98,7 @@ class ChatterboxTTS(TTSProvider):
 
     async def _post(self, body: Dict[str, Any]) -> bytes:
         try:
-            async with httpx.AsyncClient(timeout=180) as c:
-                r = await c.post(f"{self.base_url}/tts", json=body)
+            r = await self.client().post("/tts", json=body)
         except httpx.TimeoutException as e:
             raise ProviderError("chatterbox timed out",
                                 user_message="The local voice took too long. Something else is probably using the "
@@ -149,8 +161,7 @@ class ChatterboxTTS(TTSProvider):
     async def _reachable(self) -> bool:
         """Is anything answering on the voice URL, loaded or still loading?"""
         try:
-            async with httpx.AsyncClient(timeout=3) as c:
-                r = await c.get(f"{self.base_url}/health")
+            r = await self.client().get("/health", timeout=3.0)
             return r.status_code < 500
         except Exception:  # noqa: BLE001
             return False
@@ -168,8 +179,7 @@ class ChatterboxTTS(TTSProvider):
         move - the caller should wait rather than load anything.
         """
         try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(f"{self.base_url}/park")
+            r = await self.client().post("/park", timeout=10.0)
             if r.status_code >= 400:
                 return {"free": False, "busy": False, "parked": False}
             h = r.json()
@@ -181,6 +191,12 @@ class ChatterboxTTS(TTSProvider):
 
     def stop(self) -> None:
         """Only stops a server this process started; a manually launched one is left alone."""
+        client, self._client = self._client, None
+        if client is not None and not client.is_closed:
+            try:
+                asyncio.get_running_loop().create_task(client.aclose())
+            except RuntimeError:
+                pass          # no loop left to close it on; the process is going away anyway
         if self._process and self._process.poll() is None:
             self._process.terminate()
         self._process = None
@@ -188,8 +204,7 @@ class ChatterboxTTS(TTSProvider):
     # ------------------------------------------------------------------ info
     async def health(self) -> Dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                r = await c.get(f"{self.base_url}/health")
+            r = await self.client().get("/health", timeout=5.0)
             h = r.json()
         except Exception:  # noqa: BLE001
             started = self._process is not None and self._process.poll() is None
@@ -204,8 +219,7 @@ class ChatterboxTTS(TTSProvider):
 
     async def voices(self) -> list:
         try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                r = await c.get(f"{self.base_url}/voices")
+            r = await self.client().get("/voices", timeout=5.0)
             names = r.json().get("voices", [])
         except Exception:  # noqa: BLE001
             names = sorted(p.name for p in VOICE_DIR.glob("*.wav")) if VOICE_DIR.exists() else []

@@ -56,6 +56,14 @@ def test_the_bare_name_is_ignored_in_a_long_sentence():
 
 
 # ----------------------------------------------------------------- confidence gating
+def _pretend_local_model(svc, monkeypatch, unload=None):
+    """Make the stub LLM look like Ollama: something that holds VRAM and can be unloaded."""
+    async def default_unload():
+        return True
+
+    monkeypatch.setattr(svc.llm, "unload", unload or default_unload, raising=False)
+
+
 class _Segment:
     def __init__(self, text: str, no_speech_prob: float = 0.0, avg_logprob: float = -0.2):
         self.text, self.no_speech_prob, self.avg_logprob = text, no_speech_prob, avg_logprob
@@ -114,7 +122,7 @@ async def test_zeta_hands_the_card_over_on_a_small_gpu(svc, monkeypatch):
         return True
 
     monkeypatch.setattr(svc.tts, "release_gpu", park, raising=False)
-    monkeypatch.setattr(svc.llm, "unload", unload, raising=False)
+    _pretend_local_model(svc, monkeypatch, unload)
 
     await svc.balance_gpu("llm")
     await svc.balance_gpu("voice")
@@ -136,6 +144,7 @@ async def test_a_big_gpu_keeps_both_models_resident(svc, monkeypatch):
 async def test_gpu_share_off_is_respected(svc, monkeypatch):
     monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
     monkeypatch.setattr(svc.settings, "gpu_share", "off")
+    _pretend_local_model(svc, monkeypatch)
     called = []
     monkeypatch.setattr(svc.tts, "release_gpu", lambda: called.append("x"), raising=False)
 
@@ -153,6 +162,7 @@ async def test_a_model_that_fits_alongside_the_voice_turns_the_handover_off(svc,
     """
     monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
     monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    _pretend_local_model(svc, monkeypatch)
 
     svc._note_llm_size({"total_mb": 5900})
     assert svc._gpu_shared()
@@ -176,6 +186,7 @@ async def test_the_model_reloads_while_the_reply_is_being_spoken(svc, monkeypatc
     """Speaking evicts the model; without this the next question pays 15-20 s for the reload."""
     monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
     monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    _pretend_local_model(svc, monkeypatch)
     svc._note_llm_size({"total_mb": 5900})
     warmed = []
 
@@ -213,6 +224,7 @@ async def test_zeta_waits_for_a_sentence_instead_of_loading_into_a_full_card(svc
     monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
     monkeypatch.setattr(svc.settings, "gpu_share", "auto")
     monkeypatch.setattr("app.services.PARK_RETRY_SECONDS", 0.0)
+    _pretend_local_model(svc, monkeypatch)
     calls = []
 
     async def release():
@@ -230,6 +242,7 @@ async def test_a_voice_that_never_frees_the_card_is_reported_not_ignored(svc, mo
     monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
     monkeypatch.setattr(svc.settings, "gpu_share", "auto")
     monkeypatch.setattr("app.services.PARK_RETRY_SECONDS", 0.0)
+    _pretend_local_model(svc, monkeypatch)
 
     async def release():
         return {"free": False, "busy": True, "parked": False}
@@ -243,6 +256,25 @@ async def test_a_voice_that_owns_no_vram_never_blocks_a_turn(svc, monkeypatch):
     """ElevenLabs and the Windows voices have no release_gpu; a turn must not wait on them."""
     monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
     monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    _pretend_local_model(svc, monkeypatch)
     monkeypatch.delattr(type(svc.tts), "release_gpu", raising=False)
     monkeypatch.setattr(svc.tts, "release_gpu", None, raising=False)
     assert await svc.balance_gpu("llm") is True
+
+
+@pytest.mark.asyncio
+async def test_a_cloud_model_never_triggers_the_handover(svc, monkeypatch):
+    """OpenRouter and friends hold no VRAM. Parking the voice before every turn would cost a
+    4.6 s reload to make room for a model that was never on the card."""
+    monkeypatch.setattr(gpu, "gpu_memory", lambda **_: (8188, 218))
+    monkeypatch.setattr(svc.settings, "gpu_share", "auto")
+    svc._note_llm_size({"total_mb": 5900})
+
+    monkeypatch.delattr(type(svc.llm), "unload", raising=False)
+    assert not hasattr(svc.llm, "unload")
+    assert not svc._gpu_shared()
+
+    called = []
+    monkeypatch.setattr(svc.tts, "release_gpu", lambda: called.append("x"), raising=False)
+    assert await svc.balance_gpu("llm") is True
+    assert not called

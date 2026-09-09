@@ -39,7 +39,7 @@ from app.tools.base import ToolRegistry
 from app.tools.browser.service import BrowserService
 from app.tools.filesystem.index import FileIndex
 from app.tools.terminal import TerminalService
-from app.core import gpu
+from app.core import gpu, metrics
 from app.voice.wakeword import WakeWordService
 
 VOICE_VRAM_MB = 2400    # what Chatterbox needs on the GPU, measured on an RTX 4070 Laptop
@@ -188,18 +188,29 @@ class ZetaServices:
         configured) against the card, and a smaller model turns the whole mechanism off by
         itself - which is the better fix, when it is available.
         """
+        mem = gpu.gpu_memory()
+        return self.gpu_shared_for(mem[0] if mem else None)
+
+    def gpu_shared_for(self, total_mb: Optional[float]) -> bool:
+        """The same decision, given a card size someone has already measured.
+
+        Kept separate because the monitoring endpoint asks this on every poll, and spawning
+        nvidia-smi on the event loop to re-measure something it just read cost seconds on a
+        machine that was short of memory.
+        """
         mode = (self.settings.gpu_share or "auto").lower()
         if mode in ("off", "false", "no"):
             return False
-        mem = gpu.gpu_memory()
-        if not mem:
+        if not total_mb:
             return False                     # no NVIDIA GPU: nothing to hand over
+        if not hasattr(self.llm, "unload"):
+            return False                     # a cloud model holds no VRAM; parking the voice
+                                             # before every turn would cost a reload for nothing
         if mode == "on":
             return True
-        total = mem[0]
         if not self._llm_vram_mb:            # not measured yet: fall back to the card size
-            return total < SMALL_GPU_MB
-        return total < self._llm_vram_mb + VOICE_VRAM_MB + DESKTOP_VRAM_MB
+            return total_mb < SMALL_GPU_MB
+        return total_mb < self._llm_vram_mb + VOICE_VRAM_MB + DESKTOP_VRAM_MB
 
     async def synthesize(self, text: str):
         """Speak `text` in the current emotional delivery, GPU handover included.
@@ -362,6 +373,7 @@ class ZetaServices:
             await self.llm.close()
         except Exception:  # noqa: BLE001
             pass
+        metrics.sampler.stop()
         self.file_index.close()
         await database.dispose()
         self.started = False

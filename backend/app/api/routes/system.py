@@ -1,9 +1,10 @@
-"""System status, activity log, tools, permissions and first-run setup."""
+"""System status, hardware monitoring, activity log, tools, permissions and first-run setup."""
 
 from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -12,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.api.deps import require_auth, services
-from app.core import database
+from app.core import database, metrics
 from app.core.config import BACKEND_DIR, PROJECT_DIR
 from app.security import audit as audit_log
 from app.core.events import event_bus
@@ -46,6 +47,61 @@ async def clear_activity():
 @router.get("/audit")
 async def audit_entries(limit: int = 100, event: str = "", task_id: str = "", tool: str = ""):
     return await audit_log.query(limit, event=event or None, task_id=task_id or None, tool=tool or None)
+
+
+@router.get("/system/metrics")
+async def system_metrics(svc: ZetaServices = Depends(services)):
+    """CPU, memory, GPU, disks, network and battery, plus what Zeta itself is holding.
+
+    Answers from the background sampler, so this never waits on nvidia-smi. Asking starts the
+    sampling loop and keeps it alive; it stops on its own once the panel is closed.
+    """
+    snap = dict(await metrics.sampler.get())
+    snap["zeta"] = await _zeta_footprint(svc, snap.get("gpu") or {})
+    return snap
+
+
+_placement: Dict[str, Any] = {"at": 0.0, "value": {}}
+
+
+async def _placement_cached(placement, ttl: float = 3.0) -> Dict[str, Any]:
+    """Where the language model's weights are. Ollama takes ~200 ms to answer; it changes slowly."""
+    now = time.monotonic()
+    if now - _placement["at"] < ttl:
+        return _placement["value"]
+    value = await placement()
+    _placement.update(at=now, value=value)
+    return value
+
+
+async def _zeta_footprint(svc: ZetaServices, gpu_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Which of Zeta's own models are on the GPU right now, and how much they hold.
+
+    This is the view that actually answers "why is Zeta slow": the language model spilling onto
+    the CPU, or the voice holding VRAM the model needed. Nothing here measures the hardware -
+    the card's size comes from the snapshot that was already taken.
+    """
+    out: Dict[str, Any] = {"llm": {"model": svc.settings.llm_model}, "voice": {}, "sharing": False}
+    try:
+        out["sharing"] = svc.gpu_shared_for(gpu_snapshot.get("memory_total_mb"))
+    except Exception:  # noqa: BLE001
+        pass
+    placement = getattr(svc.llm, "placement", None)
+    if placement:
+        try:
+            where = await _placement_cached(placement)
+            out["llm"] = {"model": svc.settings.llm_model, **where}
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        health = await svc.tts.health()
+        out["voice"] = {"provider": svc.tts.name, "ok": health.get("ok", False),
+                        "parked": health.get("parked"), "device": health.get("holding_device") or health.get("device"),
+                        "detail": health.get("detail", "")}
+    except Exception:  # noqa: BLE001
+        pass
+    out["speech"] = {"model": svc.settings.stt_model, "device": getattr(svc.stt, "active_device", "")}
+    return out
 
 
 @router.get("/emotion")

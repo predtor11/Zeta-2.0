@@ -422,3 +422,40 @@ kbd { font-family: var(--mono); font-size: 10.5px; padding: 1px 6px; border-radi
 .mood-log .sn { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mood-log .tm { color: var(--muted); font-size: 10.5px; }
 .mood-foot { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+
+/* ---- Hardware monitor -------------------------------------------------- */
+.panel.monitor { display: flex; flex-direction: column; gap: 12px; overflow: auto; }
+.mon-card { border: 1px solid var(--border); border-radius: 12px; background: var(--glass); padding: 12px 14px; animation: fadeUp 0.35s var(--ease) both; }
+.mon-card.zeta { border-color: var(--border-strong); }
+.mon-card h4 { margin: 0 0 10px; font-size: 12px; font-weight: 600; letter-spacing: 0.7px; text-transform: uppercase; color: var(--text); display: flex; align-items: baseline; gap: 8px; }
+.mon-card h4 small { font-size: 10.5px; letter-spacing: 0.3px; text-transform: none; color: var(--muted); font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.mon-meter { margin-bottom: 9px; }
+.mon-meter:last-child { margin-bottom: 0; }
+.mon-meter-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 11px; margin-bottom: 4px; }
+.mon-meter-head .k { color: var(--muted); }
+.mon-meter-head .v { font-family: var(--mono); font-size: 11px; color: var(--text); }
+.mon-track { height: 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.07); overflow: hidden; }
+.mon-fill { height: 100%; border-radius: 999px; transition: width 0.45s var(--ease), background 0.45s var(--ease); }
+
+.mon-cores { display: grid; grid-template-columns: repeat(auto-fill, minmax(9px, 1fr)); gap: 3px; margin: 9px 0 2px; }
+.mon-core { height: 14px; border-radius: 2px; transition: background 0.4s var(--ease), opacity 0.4s var(--ease); }
+
+.mon-spark { width: 100%; height: 30px; display: block; margin-bottom: 6px; }
+.mon-spark .area { opacity: 0.13; stroke: none; }
+.mon-spark .line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+
+.mon-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 8px; margin-top: 10px; }
+.mon-stats > div { display: flex; flex-direction: column; gap: 2px; }
+.mon-stats .k { font-size: 10px; color: var(--muted); letter-spacing: 0.4px; text-transform: uppercase; }
+.mon-stats .v { font-family: var(--mono); font-size: 12px; color: var(--text); }
+
+.mon-rows { display: flex; flex-direction: column; gap: 6px; }
+.mon-row { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; align-items: baseline; }
+.mon-row .k { color: var(--muted); white-space: nowrap; }
+.mon-row .v { font-family: var(--mono); font-size: 11px; color: var(--text); text-align: right; overflow: hidden; text-overflow: ellipsis; }
+.mon-row.bad .v { color: var(--err); }
+
+.mon-note { margin: 9px 0 0; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.mon-warn { margin: 9px 0 0; font-size: 11.5px; line-height: 1.5; padding: 9px 11px; border-radius: 10px; border: 1px solid rgba(255, 84, 112, 0.4); background: rgba(255, 84, 112, 0.08); color: var(--text); }
+.mon-none { color: var(--muted); font-size: 12px; padding: 6px 2px; }

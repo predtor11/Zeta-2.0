@@ -53,6 +53,7 @@ Development mode (hot reload for both halves): `python scripts/start.py --dev`.
 | Messaging | WhatsApp via Web automation, Meta Business API, or WAPI-style gateway; local contact book | Sends always confirm |
 | Email | Gmail/Outlook/IMAP: list, search, read, draft, send, attachments | OAuth sign-in or app passwords |
 | Emotional intelligence | Reads how you seem from your words and your tone of voice (pitch, pace, pauses, energy), adapts the reply and the spoken delivery, tracks mood across the day in a Mood panel, and switches to a supportive, non-clinical response with real helplines if someone is in serious distress | Local and offline, `EMOTION_ENABLED`; see docs/EMOTION.md |
+| Hardware monitor | A Monitor panel in the right-hand rail: CPU load per core, memory, GPU load, VRAM, temperature and power, disks, network, battery, and which processes are competing with Zeta for the card. Also shows where Zeta's own model and voice weights actually are | Local, no configuration; CPU temperature needs LibreHardwareMonitor on Windows |
 | Memory | Long-term facts and preferences (remember / recall / forget), injected into context | Optional embeddings |
 | Planning | Multi-step plans shown in the UI, step status, task manager with cancellation ("Zeta, stop", Esc) | |
 | Scheduling | Reminders, one-off and recurring (cron/interval) requests, managed from the Schedules panel | Runs inside the backend |

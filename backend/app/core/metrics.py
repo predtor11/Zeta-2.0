@@ -17,10 +17,16 @@ Two things are worth knowing about Windows:
 
 Rates (disk and network throughput, CPU percent) are differences between calls, so the first
 snapshot after start-up reports zero for those.
+
+Readings are taken by a background `Sampler` rather than on the request path. Spawning
+nvidia-smi is normally 60 ms but occasionally seconds when the machine is under load - which is
+exactly when someone is watching the monitor - and a panel that stalls while reporting that the
+machine is busy is worse than useless.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -38,8 +44,25 @@ _GPU_FIELDS = ("name", "utilization.gpu", "utilization.memory", "memory.used", "
                "temperature.gpu", "power.draw", "power.limit", "clocks.sm", "clocks.max.sm", "fan.speed")
 
 _last_io: Dict[str, Tuple[float, Any, Any]] = {}   # previous counters, for per-second rates
+_cache: Dict[str, Tuple[float, Any]] = {}          # slow readings, refreshed on their own schedule
 _cpu_temp_source: Optional[str] = None             # None = not probed yet, "" = known unavailable
 _cpu_temp_reason = ""
+
+
+def _cached(key: str, ttl: float, produce):
+    """Re-use a slow reading for `ttl` seconds.
+
+    Walking every process costs about 0.8 s on this machine, which is far too much for a panel
+    that polls every couple of seconds - and the answer barely changes in that time. The cheap
+    readings (CPU, memory, GPU counters) are always taken fresh.
+    """
+    now = time.monotonic()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    value = produce()
+    _cache[key] = (now, value)
+    return value
 
 
 def _run(cmd: List[str], timeout: float = 4.0) -> str:
@@ -103,7 +126,7 @@ def cpu_temperature() -> Tuple[Optional[float], str]:
         return None, "no temperature sensor is exposed to this process"
     if _cpu_temp_source == "":
         return None, _cpu_temp_reason
-    temp = _windows_cpu_temp()
+    temp = _cached("cpu_temp", 5.0, _windows_cpu_temp)
     if temp is None and _cpu_temp_source is None:
         _cpu_temp_source = ""
         _cpu_temp_reason = ("Windows does not expose CPU temperature to a normal process. Running "
@@ -112,28 +135,33 @@ def cpu_temperature() -> Tuple[Optional[float], str]:
     return temp, "" if temp is not None else _cpu_temp_reason
 
 
+# Both Windows sources in one shot: starting PowerShell costs about a second, and asking it two
+# questions costs no more than asking it one. Prints "lhm <celsius>" or "acpi <decikelvin>".
+_TEMP_PROBE = """
+$s = Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction SilentlyContinue |
+     Where-Object { $_.SensorType -eq 'Temperature' -and $_.Name -like '*CPU*' } |
+     Measure-Object -Property Value -Maximum
+if ($s -and $s.Maximum) { "lhm " + $s.Maximum; exit }
+$z = Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue |
+     Select-Object -First 1
+if ($z -and $z.CurrentTemperature) { "acpi " + $z.CurrentTemperature }
+"""
+
+
 def _windows_cpu_temp() -> Optional[float]:
     """LibreHardwareMonitor if it is running, otherwise the ACPI thermal zone (usually blocked)."""
     global _cpu_temp_source
 
-    if _cpu_temp_source in (None, "lhm"):
-        out = _run(["powershell", "-NoProfile", "-Command",
-                    "(Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction Stop | "
-                    "Where-Object { $_.SensorType -eq 'Temperature' -and $_.Name -like '*CPU*' } | "
-                    "Measure-Object -Property Value -Maximum).Maximum"], timeout=6.0)
-        value = _num(out)
-        if value:
-            _cpu_temp_source = "lhm"
-            return round(value, 1)
-    if _cpu_temp_source in (None, "acpi"):
-        out = _run(["powershell", "-NoProfile", "-Command",
-                    "(Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature "
-                    "-ErrorAction Stop | Select-Object -First 1).CurrentTemperature"], timeout=6.0)
-        raw = _num(out)
-        if raw:                                   # tenths of a kelvin
-            _cpu_temp_source = "acpi"
-            return round(raw / 10.0 - 273.15, 1)
-    return None
+    out = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _TEMP_PROBE], timeout=8.0).split()
+    if len(out) < 2:
+        return None
+    source, value = out[0], _num(out[1])
+    if value is None:
+        return None
+    _cpu_temp_source = source
+    if source == "acpi":                          # tenths of a kelvin
+        return round(value / 10.0 - 273.15, 1)
+    return round(value, 1)
 
 
 # --------------------------------------------------------------------------- memory
@@ -174,7 +202,7 @@ def gpu() -> Dict[str, Any]:
         "clock_mhz": _num(parts[8]),
         "clock_max_mhz": _num(parts[9]),
         "fan_percent": _num(parts[10]),
-        "processes": gpu_processes(exe),
+        "processes": _cached("gpu_procs", 10.0, lambda: gpu_processes(exe)),
     }
 
 
@@ -286,8 +314,63 @@ def snapshot(*, processes: bool = True) -> Dict[str, Any]:
         "cpu": cpu(),
         "memory": memory(),
         "gpu": gpu(),
-        "disks": disks(),
+        "disks": _cached("disks", 20.0, disks),
         **io_rates(),
-        "battery": battery(),
-        "processes": top_processes() if processes else [],
+        "battery": _cached("battery", 10.0, battery),
+        "processes": _cached("top", 30.0, top_processes) if processes else [],
     }
+
+
+class Sampler:
+    """Keeps a fresh reading available, but only while someone is looking at it.
+
+    Polling the hardware forever in the background would be its own small tax on the machine, so
+    the loop starts on the first request and stops once nothing has asked for `idle_stop`
+    seconds. Callers always get an answer immediately: the first one waits for a reading, and
+    everyone after that gets the most recent one.
+    """
+
+    def __init__(self, interval: float = 3.0, idle_stop: float = 20.0):
+        self.interval = interval
+        self.idle_stop = idle_stop
+        self._latest: Optional[Dict[str, Any]] = None
+        self._task: Optional[asyncio.Task] = None
+        self._last_asked = 0.0
+
+    async def get(self) -> Dict[str, Any]:
+        self._last_asked = time.monotonic()
+        self._ensure_running()
+        if self._latest is None:
+            self._latest = await self._take()
+        return self._latest
+
+    @staticmethod
+    async def _take() -> Dict[str, Any]:
+        return await asyncio.get_running_loop().run_in_executor(None, snapshot)
+
+    def _ensure_running(self) -> None:
+        if self._task and not self._task.done():
+            return
+        try:
+            self._task = asyncio.get_running_loop().create_task(self._loop())
+        except RuntimeError:
+            self._task = None          # no loop (a synchronous caller): get() samples directly
+
+    async def _loop(self) -> None:
+        try:
+            while time.monotonic() - self._last_asked < self.idle_stop:
+                await asyncio.sleep(self.interval)
+                try:
+                    self._latest = await self._take()
+                except Exception as e:  # noqa: BLE001
+                    log.debug("metrics sampling failed: %s", e)
+        except asyncio.CancelledError:
+            raise
+
+    def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
+
+sampler = Sampler()

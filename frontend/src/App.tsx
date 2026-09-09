@@ -5,6 +5,7 @@ import Chat from "./components/Chat";
 import ConfirmationModal from "./components/ConfirmationModal";
 import ConversationList from "./components/ConversationList";
 import MemoryPanel from "./components/MemoryPanel";
+import MonitorPanel from "./components/MonitorPanel";
 import MoodPanel from "./components/MoodPanel";
 import PlanView from "./components/PlanView";
 import SchedulesPanel from "./components/SchedulesPanel";
@@ -17,7 +18,7 @@ import { useVoice } from "./hooks/useVoice";
 import { useZeta } from "./hooks/useZeta";
 import { api } from "./services/api";
 
-type RightTab = "chat" | "activity" | "mood" | "tools" | "tasks" | "memory" | "schedules" | "audit";
+type RightTab = "chat" | "activity" | "mood" | "tools" | "tasks" | "memory" | "schedules" | "audit" | "monitor";
 const TABS: { id: RightTab; label: string; icon: string }[] = [
   { id: "chat", label: "Chat", icon: "▤" },
   { id: "activity", label: "Activity", icon: "◍" },
@@ -27,6 +28,7 @@ const TABS: { id: RightTab; label: string; icon: string }[] = [
   { id: "memory", label: "Memory", icon: "◈" },
   { id: "schedules", label: "Schedules", icon: "◷" },
   { id: "audit", label: "Audit", icon: "▣" },
+  { id: "monitor", label: "Monitor", icon: "◉" },
 ];
 
 function isEditable(el: EventTarget | null): boolean {
@@ -147,6 +149,8 @@ export default function App() {
           {tab === "memory" && <MemoryPanel />}
           {tab === "schedules" && <SchedulesPanel />}
           {tab === "audit" && <AuditPanel />}
+          {/* Mounted only while open: it polls the hardware every two seconds. */}
+          {tab === "monitor" && <MonitorPanel />}
         </div>}
       </aside>
 
