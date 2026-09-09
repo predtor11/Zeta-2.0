@@ -224,6 +224,17 @@ If you already have a server on that URL (a `start_tts.bat` window, say), Zeta u
 | `CHATTERBOX_EXAGGERATION` / `CHATTERBOX_CFG_WEIGHT` | Baseline emotion and pacing; the emotion engine overrides them per reply |
 | `CHATTERBOX_LANGUAGE` | `multilingual` only. Empty = detect from the reply (Devanagari means Hindi) |
 
+**Switching to `multilingual` downloads a different model.** Turbo/base and multilingual share a
+repo but not their weights: multilingual pulls `t3_mtl23ls_v2.safetensors`, `s3gen.pt`, `ve.pt`,
+`grapheme_mtl_merged_expanded_v1.json` and `Cangjie5_TC.json`, about 3 GB on top of what you already
+have. The server does it on first start, so the first launch after the switch is a long one.
+
+If your network blocks huggingface.co (the API answers but transfers stall), fetch them first with
+`HF_ENDPOINT=https://hf-mirror.com` and `HF_HUB_DISABLE_XET=1`. Ask for **each file by name** with
+`hf_hub_download`: against the mirror, `snapshot_download` returns success in about two seconds
+having fetched nothing, because its repo listing comes back empty and every pattern matches nothing.
+It looks exactly like a fast cache hit.
+
 **Changing the voice.** Put a clean 7-15 second WAV of the voice you want in `voice/`, set
 `CHATTERBOX_VOICE=voice/your_clip.wav`, and restart the voice server. One speaker, no music, no echo.
 Only clone a voice you have the right to use.
@@ -261,29 +272,55 @@ becomes "the link". Headings and bullets get a full stop so they do not run into
 documentation: synthesize `[tag] That is a shame...`, then transcribe the clip back with Whisper and
 see whether the tag comes back as a word.
 
-| Tag | Result |
-|-----|--------|
-| `[sigh]` `[chuckle]` `[laugh]` `[gasp]` `[sniff]` `[cough]` | performed - sound only, no extra words |
-| `[breath]` `[giggle]` `[whisper]` `[clears throat]` | **read out loud** ("Breath. That is a shame...") |
+| Tag | Turbo | Multilingual |
+|-----|-------|--------------|
+| `[sigh]` `[gasp]` | performed | performed |
+| `[chuckle]` `[laugh]` `[sniff]` `[cough]` | performed | **read out loud** ("Laugh. That is a shame...") |
+| `[breath]` `[giggle]` `[whisper]` `[clears throat]` | **read out loud** | read out loud |
 
-So only the first row is allowed through; the rest are mapped to a neighbour or dropped. Zeta uses a
+The two models genuinely differ, so the allowed set is keyed by model (`CHATTERBOX_SOUNDS` in
+`backend/app/emotion/speech.py`, mirrored in the voice server). A sound the loaded model cannot
+perform is dropped rather than spoken, and the language model is only told about cues it can make. Zeta uses a
 sound at the start of a reply *sometimes* rather than always (25-60% depending on the mood) - the same
 little sigh before every gentle answer sounds more synthetic than no sigh at all - and only on the
 first piece of a streamed reply.
 
-**Speaking Hindi.** Two separate halves:
+**Speaking Hindi: two voices, not one.** Understanding Hindi works today - faster-whisper is
+multilingual (verified: `small` reports `is_multilingual = True`), so leave `STT_LANGUAGE` empty and
+it detects the language per utterance. It used to be pinned to `en`, which forced English text out of
+Hindi speech.
 
-* *Understanding* it works today. faster-whisper is multilingual (verified: `small` reports
-  `is_multilingual = True`), so leave `STT_LANGUAGE` empty and it detects the language per utterance.
-  It was previously pinned to `en`, which forced English out of Hindi speech.
-* *Speaking* it needs `CHATTERBOX_MODEL=multilingual`. Turbo is English-only: given
-  `नमस्ते, मैं ठीक हूँ। आप कैसे हैं?` it produced 16 s of audio that Whisper transcribes as
-  "Comeway. Comewood's lit-scar..." - it is not accented Hindi, it is nonsense. Zeta logs a warning
-  once if it is asked to speak a non-English reply on an English-only model.
+Speaking it is the harder half, and neither model is the answer on its own. Measured here:
 
-The wake word stays English (the phrase is "Hey Zeta"), and the language of a reply is detected from
-its script, so a Hindi answer is spoken as Hindi automatically once the multilingual model is set.
-Romanised Hinglish ("kya haal hai") is indistinguishable from English here and is left to the default.
+| | Turbo | Multilingual |
+|---|---|---|
+| English | **1.7-2.2x realtime** | 0.37x realtime |
+| Hindi | 16 s of nonsense ("Comeway. Comewood's lit-scar...") | correct - Whisper detects `hi` at p=1.00 |
+| VRAM | ~2.0 GB | ~3.2 GB |
+| Performs `[laugh]`/`[chuckle]` | yes | **no - reads them out as words** |
+
+Turbo is fast enough to generate the next sentence while the current one plays, which is what makes
+streamed speech work; multilingual at 0.37x cannot keep up, so an English reply that costs 9.5 s of
+compute on turbo costs about 50 s. Making English pay that to get Hindi is a bad trade. Classifier-free
+guidance is not the cause, incidentally: `cfg_weight` 0.5, 0.3 and 0.0 all land at 0.35-0.39x.
+
+So Zeta runs both and picks per reply, by the script the text is written in:
+
+```
+CHATTERBOX_MODEL=turbo                              # everyday voice, English
+CHATTERBOX_NON_ENGLISH_MODEL=multilingual           # empty = off
+CHATTERBOX_NON_ENGLISH_URL=http://127.0.0.1:8767
+```
+
+Only one holds the graphics card at a time - before speaking, the other is parked into system RAM and
+comes back in 2-3 s, the same handover already used between the voice and the language model. The
+second server is started lazily, the first time something non-English is actually said, so an
+English-only day never loads it. `GET /api/system/status` shows "not started yet" until then; that is
+normal, not a fault.
+
+The wake word stays English (the phrase is "Hey Zeta"). Romanised Hinglish ("kya haal hai") reads as
+English by script and is spoken by turbo, which handles it passably - better, at least, than waiting
+50 seconds for the multilingual model to say the same sentence.
 
 **Emotion.** Turbo ignores `exaggeration` and `cfg_weight`, so Zeta shapes its delivery through
 `temperature` there (steadier when you sound low, livelier when you sound happy). The `base` and

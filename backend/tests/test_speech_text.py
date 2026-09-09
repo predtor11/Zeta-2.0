@@ -133,3 +133,24 @@ async def test_an_essay_is_read_to_a_point_and_says_so():
     out = await speak_plan(SpeakRequest(text="This is a sentence. " * 900))
     assert out["truncated"] is True
     assert sum(len(s) for s in out["segments"]) <= MAX_SPEECH_CHARS
+
+
+# ------------------------------------------------------------------ per-model sounds
+def test_multilingual_never_gets_a_sound_it_would_read_out(monkeypatch):
+    """Turbo performs [laugh]; multilingual says "Laugh." out loud. Same tag, same code path,
+    so the allowed set has to depend on which model is loaded."""
+    monkeypatch.setattr(speech, "_rng", type("D", (), {"random": lambda self: 0.0})())
+    playful = speech.STYLES["playful"]                      # its sound is a chuckle
+    assert speech.prepare("oh dear", playful, "chatterbox") == "[chuckle] oh dear"
+    assert speech.prepare("oh dear", playful, "chatterbox-multilingual") == "oh dear"
+
+
+def test_a_written_tag_the_model_cannot_perform_is_dropped_not_spoken():
+    assert speech.prepare("[laughs] oh dear", speech.STYLES["neutral"], "chatterbox-multilingual") == "oh dear"
+    assert speech.prepare("[sighs] oh dear", speech.STYLES["neutral"], "chatterbox-multilingual") == "[sigh] oh dear"
+
+
+def test_the_model_is_only_told_about_cues_it_can_actually_make():
+    note = speech.prompt_note("chatterbox-multilingual")
+    assert "[sighs]" in note and "[laughs]" not in note and "[chuckles]" not in note
+    assert "[laughs]" in speech.prompt_note("chatterbox")

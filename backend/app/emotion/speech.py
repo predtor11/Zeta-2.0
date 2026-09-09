@@ -52,6 +52,19 @@ CHATTERBOX_TAGS = {
     "sighs": "sigh", "exhales": "sigh", "breathes": "sigh", "hesitates": "sigh", "gasps": "gasp",
 }
 
+# ...and which of them each Chatterbox model performs rather than pronounces. Turbo and
+# multilingual genuinely differ - measured the same way on both, multilingual says "Laugh."
+# and "Chuckle," out loud where turbo performs them - so this is keyed by model, and a sound
+# missing from the set is dropped rather than spoken.
+CHATTERBOX_SOUNDS = {
+    "chatterbox": {"sigh", "chuckle", "laugh", "gasp", "sniff", "cough"},
+    "chatterbox-multilingual": {"sigh", "gasp"},
+}
+
+
+def chatterbox_sounds(model: str) -> set:
+    return CHATTERBOX_SOUNDS.get(model, CHATTERBOX_SOUNDS["chatterbox"])
+
 # Sounds are meant to be occasional. Zeta doing the same little sigh before every gentle
 # reply is more obviously synthetic than no sound at all, so each one is a coin flip.
 _rng = random.Random()
@@ -282,27 +295,30 @@ def prepare(text: str, style: SpeechStyle, model: str, lead: bool = True) -> str
     if not supports_tags:
         return for_display(spoken)
     if model.startswith("chatterbox"):
-        return _for_chatterbox(spoken, style, lead)
+        return _for_chatterbox(spoken, style, lead, model)
     cleaned, _ = split_tags(spoken)
     if lead and style.lead_tag and style.lead_tag in ALLOWED_TAGS:
         return f"[{style.lead_tag}] {cleaned}"
     return cleaned
 
 
-def _for_chatterbox(text: str, style: SpeechStyle, lead: bool = True) -> str:
+def _for_chatterbox(text: str, style: SpeechStyle, lead: bool = True, model: str = "chatterbox") -> str:
     """Chatterbox performs sounds, not moods: keep [laugh]/[sigh], drop [warmly] and friends.
 
     The mood is carried by `style.chatterbox` (exaggeration and pacing) instead, so nothing
-    is lost. The style's own sound is only used sometimes - see `_rng`.
+    is lost. The style's own sound is only used sometimes - see `_rng` - and only when this
+    particular model performs it rather than reading it out.
     """
+    performs = chatterbox_sounds(model)
+
     def take(m: re.Match) -> str:
         tag = m.group(1).strip().lower()
         mapped = CHATTERBOX_TAGS.get(tag, tag if tag in CHATTERBOX_TAGS.values() else "")
-        return f"[{mapped}]" if mapped else " "
+        return f"[{mapped}]" if mapped in performs else " "
 
     cleaned = re.sub(r"[ \t]{2,}", " ", _TAG_RE.sub(take, text)).strip()
     # One cue per reply: a tag the model already wrote wins over the style's default.
-    if not lead or not style.sound or _TAG_RE.search(cleaned):
+    if not lead or style.sound not in performs or _TAG_RE.search(cleaned):
         return cleaned
     return f"[{style.sound}] {cleaned}" if _rng.random() < style.sound_chance else cleaned
 
@@ -312,7 +328,9 @@ def prompt_note(model: str) -> str:
     if not any(model.startswith(m) for m in TAG_MODELS):
         return ""
     if model.startswith("chatterbox"):
-        cues = "[sighs], [laughs], [chuckles], [gasps]"
+        performs = chatterbox_sounds(model)
+        names = {"sigh": "[sighs]", "laugh": "[laughs]", "chuckle": "[chuckles]", "gasp": "[gasps]"}
+        cues = ", ".join(v for k, v in names.items() if k in performs)
     else:
         cues = "[laughs], [giggles], [sighs], [gently], [warmly], [excited]"
     return ("How you sound: your reply is spoken aloud as well as written, so write it the way you would say it. "

@@ -225,10 +225,21 @@ class ElevenLabsTTS(TTSProvider):
 def build_tts_provider(settings: Settings) -> TTSProvider:
     p = settings.tts_provider
     if p == TTSProviderName.CHATTERBOX:
-        return ChatterboxTTS(settings.chatterbox_base_url, settings.chatterbox_voice, settings.chatterbox_model,
-                             settings.chatterbox_device, settings.chatterbox_exaggeration, settings.chatterbox_cfg_weight,
-                             settings.chatterbox_temperature, settings.chatterbox_autostart,
-                             idle_unload=settings.chatterbox_idle_unload, language=settings.chatterbox_language)
+        def _chatterbox(url: str, model: str, language: str) -> ChatterboxTTS:
+            return ChatterboxTTS(url, settings.chatterbox_voice, model,
+                                 settings.chatterbox_device, settings.chatterbox_exaggeration, settings.chatterbox_cfg_weight,
+                                 settings.chatterbox_temperature, settings.chatterbox_autostart,
+                                 idle_unload=settings.chatterbox_idle_unload, language=language)
+
+        main = _chatterbox(settings.chatterbox_base_url, settings.chatterbox_model, settings.chatterbox_language)
+        if not settings.chatterbox_non_english_model:
+            return main
+        # Two voices, picked per reply by the script the text is written in. The second one is
+        # started lazily, so an English-only day never loads it at all.
+        from app.providers.tts.routed import LanguageRoutedTTS
+
+        return LanguageRoutedTTS(main, _chatterbox(settings.chatterbox_non_english_url,
+                                                   settings.chatterbox_non_english_model, ""))
     if p == TTSProviderName.LOCAL:
         return LocalTTS(settings.tts_voice, settings.tts_rate)
     if p == TTSProviderName.PIPER:

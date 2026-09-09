@@ -56,6 +56,19 @@ class ChatterboxTTS(TTSProvider):
         self._starting: Optional[asyncio.Task] = None
         self._client: Optional[httpx.AsyncClient] = None
 
+    @property
+    def port(self) -> int:
+        """The port this client talks to - a second voice must be started on its own."""
+        try:
+            return int(self.base_url.rsplit(":", 1)[1].split("/")[0])
+        except (IndexError, ValueError):
+            return 8766
+
+    @property
+    def vram_mb(self) -> int:
+        """Measured on an RTX 4070 Laptop: turbo ~2.0 GB, multilingual ~3.2 GB."""
+        return 3300 if self.model == "multilingual" else 2400
+
     def client(self) -> httpx.AsyncClient:
         """One client, kept open.
 
@@ -76,7 +89,9 @@ class ChatterboxTTS(TTSProvider):
 
     @property
     def speech_model(self) -> str:
-        return "chatterbox"
+        """Which delivery dialect this voice speaks. The variant matters: turbo performs
+        [laugh] and [chuckle], multilingual reads them out as words."""
+        return "chatterbox-multilingual" if self.model == "multilingual" else "chatterbox"
 
     def _params(self, style: Any) -> Dict[str, float]:
         """Emotion -> generation knobs. Exaggeration is intensity; cfg_weight is pacing (lower = slower)."""
@@ -149,7 +164,7 @@ class ChatterboxTTS(TTSProvider):
         mine = self._process is not None and self._process.poll() is None
         if not mine and not await self._reachable():
             cmd = [str(VENV_PYTHON), "-u", str(SERVER), "--model", self.model, "--device", self.device,
-                   "--idle-unload", str(self.idle_unload)]
+                   "--port", str(self.port), "--idle-unload", str(self.idle_unload)]
             if self.voice:
                 cmd += ["--voice", self.voice]
             log.info("Starting the Chatterbox voice server: %s", " ".join(cmd[1:]))

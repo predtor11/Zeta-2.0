@@ -55,17 +55,22 @@ log = logging.getLogger("chatterbox-server")
 # sigh, chuckle, laugh, gasp, sniff and cough come back as sound with no extra words, while
 # breath, giggle, whisper and "clears throat" come back as "Breath. That is a shame..." - the
 # voice reads the tag out. Those four are deliberately absent.
+# The multilingual model is not the same voice: measured the same way, it says "Laugh." and
+# "Chuckle," out loud where turbo performs them. Only sigh and gasp survive on both.
 TAGS = {"laugh", "laughs", "chuckle", "chuckles", "sigh", "sighs",
         "gasp", "gasps", "cough", "coughs", "sniff", "sniffs"}
+MULTILINGUAL_TAGS = {"sigh", "sighs", "gasp", "gasps"}
 _TAG_RE = re.compile(r"\[([a-z][a-z ']{1,24})\]", re.I)
 _SENT_RE = re.compile(r"(?<=[.!?…।])\s+")     # danda too, so Hindi splits into sentences as well
 MAX_CHARS = 280          # Chatterbox degrades on very long inputs; split on sentences instead
 
 
-def clean_text(text: str) -> str:
-    """Keep the tags Chatterbox knows, drop the ones it would pronounce."""
+def clean_text(text: str, model: str = "turbo") -> str:
+    """Keep the tags this model performs, drop the ones it would pronounce."""
+    allowed = MULTILINGUAL_TAGS if model == "multilingual" else TAGS
+
     def take(m: "re.Match[str]") -> str:
-        return m.group(0) if m.group(1).strip().lower() in TAGS else " "
+        return m.group(0) if m.group(1).strip().lower() in allowed else " "
 
     return re.sub(r"\s{2,}", " ", _TAG_RE.sub(take, text)).strip()
 
@@ -294,7 +299,7 @@ class Engine:
         pieces: List["np.ndarray"] = []
         with self._lock:
             self.resume()
-            for part in chunks(clean_text(text)):
+            for part in chunks(clean_text(text, self.model_name)):
                 kwargs: Dict[str, Any] = {"temperature": temperature}
                 if self.model_name == "turbo":
                     # Turbo has no CFG or exaggeration control; more emotion becomes more
@@ -305,8 +310,10 @@ class Engine:
                     kwargs["cfg_weight"] = cfg_weight
                 if prompt:
                     kwargs["audio_prompt_path"] = prompt
-                if language and self.model_name == "multilingual":
-                    kwargs["language_id"] = language
+                if self.model_name == "multilingual":
+                    # Not optional: ChatterboxMultilingualTTS.generate() takes language_id as a
+                    # required argument, so leaving it out is a TypeError on every English reply.
+                    kwargs["language_id"] = language or "en"
                 wav = self.model.generate(part, **self._supported(kwargs))
                 audio = wav.detach().cpu().numpy() if isinstance(wav, torch.Tensor) else np.asarray(wav)
                 pieces.append(audio.reshape(-1))

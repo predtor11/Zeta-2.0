@@ -177,6 +177,22 @@ def test_provider_factory_builds_chatterbox_from_settings(svc, monkeypatch):
     s = svc.settings
     monkeypatch.setattr(s, "tts_provider", TTSProviderName.CHATTERBOX)
     monkeypatch.setattr(s, "chatterbox_voice", "voice/zeta_female.wav")
+    monkeypatch.setattr(s, "chatterbox_non_english_model", "")      # one voice, the plain case
     p = build_tts_provider(s)
     assert isinstance(p, ChatterboxTTS)
     assert p.voice == "voice/zeta_female.wav" and p.model == s.chatterbox_model
+
+
+def test_a_second_language_model_makes_the_factory_build_a_router(svc, monkeypatch):
+    """Configuring a non-English model is what turns one voice into two."""
+    from app.providers.tts.routed import LanguageRoutedTTS
+
+    s = svc.settings
+    monkeypatch.setattr(s, "tts_provider", TTSProviderName.CHATTERBOX)
+    monkeypatch.setattr(s, "chatterbox_model", "turbo")
+    monkeypatch.setattr(s, "chatterbox_non_english_model", "multilingual")
+    monkeypatch.setattr(s, "chatterbox_non_english_url", "http://127.0.0.1:8767")
+    p = build_tts_provider(s)
+    assert isinstance(p, LanguageRoutedTTS)
+    assert p.english.model == "turbo" and p.other.model == "multilingual"
+    assert p.english.port == 8766 and p.other.port == 8767

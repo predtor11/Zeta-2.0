@@ -42,7 +42,7 @@ from app.tools.terminal import TerminalService
 from app.core import gpu, metrics
 from app.voice.wakeword import WakeWordService
 
-VOICE_VRAM_MB = 2400    # what Chatterbox needs on the GPU, measured on an RTX 4070 Laptop
+VOICE_VRAM_MB = 2400    # fallback for a voice that does not report its own footprint
 DESKTOP_VRAM_MB = 800   # what Windows, the browser and a live wallpaper take before Zeta starts
 SMALL_GPU_MB = 12288    # fallback guess before the model's real size is known
 PARK_ATTEMPTS = 8       # a sentence takes a few seconds; wait it out rather than load into a full card
@@ -210,7 +210,8 @@ class ZetaServices:
             return True
         if not self._llm_vram_mb:            # not measured yet: fall back to the card size
             return total_mb < SMALL_GPU_MB
-        return total_mb < self._llm_vram_mb + VOICE_VRAM_MB + DESKTOP_VRAM_MB
+        voice_mb = getattr(self.tts, "vram_mb", VOICE_VRAM_MB)
+        return total_mb < self._llm_vram_mb + voice_mb + DESKTOP_VRAM_MB
 
     async def synthesize(self, text: str, lead: bool = True, final: bool = True):
         """Speak `text` in the current emotional delivery, GPU handover included.
