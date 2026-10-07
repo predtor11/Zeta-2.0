@@ -1,11 +1,13 @@
-# ZETA
+# Zeta
 
-A local-first, JARVIS-style AI agent for your Windows computer. Tell Zeta what you want in
+A local-first AI agent for your Windows computer. Tell Zeta what you want in
 natural language (text or voice); it plans, picks tools, asks before doing anything dangerous,
 executes, and reports honestly.
 
+Zeta is public and open source: try it, fork it, and contributions are welcome.
+
 ```
-"Find the PDF I edited yesterday about bus scheduling and open it."
+"Hey Zeta, open Spotify and remind me to call Mom at six."
 "What's using all my memory?"                "Open VS Code and switch to Chrome."
 "Search the web for the cheapest OLED 240Hz monitors in India."
 "Check why my backend isn't running."        "Send Rahul a WhatsApp saying I'll be 20 minutes late."
@@ -146,4 +148,4 @@ cd backend
 
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).
