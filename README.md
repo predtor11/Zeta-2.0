@@ -38,6 +38,27 @@ email and screen control off until you enable them.
 
 Development mode (hot reload for both halves): `python scripts/start.py --dev`.
 
+## Hardware requirements
+
+Nothing in Zeta requires a GPU - every local piece also runs on CPU - but a GPU is what makes
+the local LLM and local voice pleasant instead of merely possible.
+
+| | CPU only | With an NVIDIA GPU |
+|---|---|---|
+| LLM (Ollama/LM Studio) | Works; a quantized 7-8B model is seconds-to-tens-of-seconds per reply | 6 GB+ VRAM fits a quantized 7-8B model comfortably; 8 GB leaves room for voice too |
+| STT (local Whisper, default) | Works; `small` model measured ~7 s per utterance | Same model measured ~0.6 s per utterance |
+| TTS (Chatterbox, default) | Works but measured ~0.1x realtime (~20 s of compute per second of speech) - noticeable, not snappy | Measured ~0.4-0.5x realtime (~2 s compute per second of speech), ~2 GB VRAM (Turbo); +~3 GB if a second language model is also loaded |
+
+Measured on an RTX 4070 Laptop (8 GB VRAM); see `docs/INTEGRATIONS.md` for more numbers and tuning.
+16 GB+ system RAM is recommended if you run the local LLM and Chatterbox together: Zeta hands the
+GPU back and forth between them, and the idle one parks in system RAM rather than vanishing.
+Chatterbox's weights are ~2-3 GB on disk (more if you enable the multilingual model); Ollama model
+files are several GB each.
+
+No capable GPU, or want to skip the local voice entirely? Use a cloud LLM provider
+(`LLM_PROVIDER=openai|anthropic|openrouter`), ElevenLabs for TTS, and Whisper `small` for STT - it
+runs adequately on CPU, or switch `STT_PROVIDER=elevenlabs` for the Scribe API instead.
+
 ## What works today
 
 | Area | Capabilities | Notes |
