@@ -60,6 +60,27 @@ _HALLUCINATIONS = {
 }
 
 
+def gate_rms(sensitivity: float, noise: float) -> float:
+    """The RMS a frame has to beat before its window is worth handing to Whisper.
+
+    This is a *CPU* decision, not an accuracy one. Everything that decides whether something was
+    really the wake word - Whisper's own VAD, `_reject_reason`, `phrase_matches` - runs after it.
+    So a high gate buys nothing and can cost everything: it discards audio before any of those
+    see it, silently, and there is no counter anywhere that goes up when it does.
+
+    Measured on this laptop's microphone array: the room floor sits at RMS ~205 and the loudest
+    noise frame over half a minute of an empty room was 356. The old gate - the larger of 500 and
+    three times the floor - therefore stood at 615. A synthesized "hey zeta" scaled to an overall
+    RMS of 400 has six 80 ms frames above 390 but only four above 615, one short of the five the
+    engine needs before it will transcribe anything: quiet speech was being dropped by one frame.
+
+    So the default lands at about 390 - above the loudest thing an empty room produced, and low
+    enough to leave that phrase a frame or two of margin rather than none.
+    """
+    sens = min(1.0, max(0.0, sensitivity))
+    return max(450.0 - 250.0 * sens, noise * (2.4 - 1.0 * sens))
+
+
 def looks_hallucinated(text: str) -> bool:
     """True for the stock things Whisper emits on non-speech, and for stuck repetitions."""
     stripped = text.strip().lower().strip(" .!?,")
@@ -127,7 +148,7 @@ class WakeEngine:
 class WhisperPhraseEngine(WakeEngine):
     name = "whisper"
 
-    def __init__(self, phrase: str, model_size: str = "tiny", window_seconds: float = 2.5, min_speech_ms: int = 400,
+    def __init__(self, phrase: str, model_size: str = "base", window_seconds: float = 2.5, min_speech_ms: int = 400,
                  silence_ms: int = 450, sensitivity: float = 0.5):
         import numpy as np  # noqa: F401  (validated at construction)
         from faster_whisper import WhisperModel
@@ -147,12 +168,28 @@ class WhisperPhraseEngine(WakeEngine):
         # A tiny Whisper model will confidently write words for a fan or a cough, so each of
         # these is a separate reason to throw a candidate away.
         sens = min(1.0, max(0.0, sensitivity))
-        self.energy_floor = 700.0 - 400.0 * sens        # RMS a frame needs before it counts as speech
+        self.sensitivity = sens                         # the energy gate is `gate_rms`, see there
         self.match_threshold = 0.86 - 0.10 * sens       # how close the words have to be
         self.no_speech_max = 0.20 + 0.55 * sens         # Whisper's own "there was no speech here"
-        self.logprob_min = -0.45 - 1.05 * sens          # ...and its confidence in what it wrote
+        # ...and its confidence in what it wrote. Measured on real utterances: `tiny` scored a
+        # genuine "hey zeta" at -1.03 and -1.52 and wrote it as "Hey OpenRouter.com", so at the old
+        # -0.98 the model's own weakness was being read as evidence that nobody had spoken. `base`
+        # scores the same phrase at -0.07, which is what this is really for - but the bar is still
+        # set below where real speech was actually landing rather than above it.
+        self.logprob_min = -0.75 - 1.05 * sens
         self.rejected = 0                               # candidates thrown away (shown in status)
         self.last_rejected = ""
+        # Everything below is diagnostic, and it exists because "it never wakes up" was not
+        # answerable from the outside: detections and rejections were both zero, which is equally
+        # consistent with a dead microphone, a gate nothing can cross, a VAD that hears nothing,
+        # and a matcher that is too fussy. Each of these separates one of those from the others.
+        self.frames = 0                                 # frames actually fed to the engine
+        self.level = 0.0                                # decaying peak RMS, i.e. what it can hear
+        self.gate = 0.0                                 # ...and what it currently has to beat
+        self.heard = 0                                  # utterances loud and long enough to transcribe
+        self.empty = 0                                  # ...of which Whisper made nothing at all
+        self.short = 0                                  # ...and which were too brief to bother with
+        self.last_transcript = ""                       # the last thing it thought it heard, matched or not
 
     def _rms(self, frame) -> float:
         f = frame.astype(self.np.float32)
@@ -163,7 +200,10 @@ class WhisperPhraseEngine(WakeEngine):
         frame = frame.reshape(-1)
         self.buffer = np.concatenate([self.buffer, frame])[-self.window:]
         rms = self._rms(frame)
-        threshold = max(self.energy_floor, self.noise * 3.0)
+        threshold = gate_rms(self.sensitivity, self.noise)
+        self.frames += 1
+        self.level = max(rms, self.level * 0.97)        # decays over a couple of seconds
+        self.gate = threshold
         if rms > threshold:
             self.in_speech = True
             self.speech_frames += 1
@@ -177,7 +217,9 @@ class WhisperPhraseEngine(WakeEngine):
             had = self.speech_frames
             self.in_speech, self.speech_frames, self.silent_frames = False, 0, 0
             if had < self.min_speech_frames:
+                self.short += 1
                 return None
+            self.heard += 1
             audio = self.buffer.astype(np.float32) / 32768.0
             try:
                 # Whisper's own VAD runs first: on room noise it returns no segments at all, which
@@ -200,6 +242,16 @@ class WhisperPhraseEngine(WakeEngine):
                 return None
             text = " ".join(seg.text for seg in segs).strip()
             if not text:
+                self.empty += 1
+                return None
+            self.last_transcript = text
+            log.debug("wake candidate: %r", text)
+            # Match first, judge second. Confidence is not a test of whether somebody spoke - it is
+            # a test of whether a transcript that *does* look like the wake word can be trusted, and
+            # running it the other way round meant ordinary passing conversation was being scored,
+            # counted as a rejection, and reported as though Zeta had nearly woken up. Anything that
+            # is not the phrase is simply not the phrase.
+            if not phrase_matches(text, self.phrase, threshold=self.match_threshold):
                 return None
             reason = self._reject_reason(segs, text)
             if reason:
@@ -207,10 +259,8 @@ class WhisperPhraseEngine(WakeEngine):
                 self.last_rejected = f"{text} ({reason})"
                 log.debug("wake candidate rejected: %r - %s", text, reason)
                 return None
-            log.debug("wake candidate: %r", text)
-            if phrase_matches(text, self.phrase, threshold=self.match_threshold):
-                self.buffer = np.zeros(0, dtype=np.int16)
-                return text
+            self.buffer = np.zeros(0, dtype=np.int16)
+            return text
         return None
 
     def _reject_reason(self, segs: list, text: str) -> str:
@@ -255,11 +305,12 @@ class OpenWakeWordEngine(WakeEngine):
 class WakeWordService:
     def __init__(self, *, enabled: bool, phrase: str = "hey zeta", engine: str = "auto", model: str = "",
                  sensitivity: float = 0.5, device: str = "", on_wake: Optional[Callable[[str, str], None]] = None,
-                 cooldown_seconds: float = 4.0, beep: bool = True):
+                 cooldown_seconds: float = 4.0, beep: bool = True, whisper_model: str = "base"):
         self.enabled = enabled
         self.phrase = phrase or "hey zeta"
         self.engine_name = (engine or "auto").lower()
         self.model_name = model
+        self.whisper_model = whisper_model or "base"
         self.sensitivity = sensitivity
         self.device = device
         self.on_wake = on_wake
@@ -304,7 +355,18 @@ class WakeWordService:
                 "last_detection": self.last_detection, "sensitivity": self.sensitivity,
                 "rejected": getattr(self._engine, "rejected", 0),
                 "last_rejected": getattr(self._engine, "last_rejected", ""),
-                "muted_for": max(0.0, round(self.paused_until - time.monotonic(), 1))}
+                "muted_for": max(0.0, round(self.paused_until - time.monotonic(), 1)),
+                # Where an utterance stops getting through, read left to right: frames arriving at
+                # all, level against gate, then how many got past each stage.
+                "frames": getattr(self._engine, "frames", 0),
+                "level": round(getattr(self._engine, "level", 0.0)),
+                "gate": round(getattr(self._engine, "gate", 0.0)),
+                "noise_floor": round(getattr(self._engine, "noise", 0.0)),
+                "heard": getattr(self._engine, "heard", 0),
+                "too_short": getattr(self._engine, "short", 0),
+                "empty": getattr(self._engine, "empty", 0),
+                # The single most useful line when it will not wake up: what it thought you said.
+                "last_transcript": getattr(self._engine, "last_transcript", "")}
 
     # ---- internals -----------------------------------------------------
     def _build_engine(self) -> WakeEngine:
@@ -319,8 +381,19 @@ class WakeWordService:
                 if want == "openwakeword":
                     raise RuntimeError(f"openwakeword unavailable: {e}. Run: pip install openwakeword") from e
         try:
-            return WhisperPhraseEngine(self.phrase, sensitivity=self.sensitivity)
+            return WhisperPhraseEngine(self.phrase, model_size=self.whisper_model, sensitivity=self.sensitivity)
         except Exception as e:  # noqa: BLE001
+            # Loading can fail for want of memory rather than anything being wrong - two parked
+            # voice models sit in system RAM, and this machine has been seen with 0.5 GB of 15.7
+            # free. A listener that mis-hears sometimes beats no listener at all, and the reason
+            # it stepped down should be in the log rather than inferred later.
+            if self.whisper_model != "tiny":
+                log.warning("The %r wake-word model would not load (%s: %s); falling back to tiny, "
+                            "which mis-hears the phrase more often.", self.whisper_model, type(e).__name__, e)
+                try:
+                    return WhisperPhraseEngine(self.phrase, model_size="tiny", sensitivity=self.sensitivity)
+                except Exception as smaller:  # noqa: BLE001
+                    e = smaller
             raise RuntimeError(f"wake word needs faster-whisper + numpy: {e}. Run: pip install faster-whisper numpy sounddevice") from e
 
     def _run(self) -> None:

@@ -225,21 +225,25 @@ class ElevenLabsTTS(TTSProvider):
 def build_tts_provider(settings: Settings) -> TTSProvider:
     p = settings.tts_provider
     if p == TTSProviderName.CHATTERBOX:
-        def _chatterbox(url: str, model: str, language: str) -> ChatterboxTTS:
-            return ChatterboxTTS(url, settings.chatterbox_voice, model,
+        def _chatterbox(url: str, model: str, language: str, voice: str) -> ChatterboxTTS:
+            return ChatterboxTTS(url, voice, model,
                                  settings.chatterbox_device, settings.chatterbox_exaggeration, settings.chatterbox_cfg_weight,
                                  settings.chatterbox_temperature, settings.chatterbox_autostart,
                                  idle_unload=settings.chatterbox_idle_unload, language=language)
 
-        main = _chatterbox(settings.chatterbox_base_url, settings.chatterbox_model, settings.chatterbox_language)
+        main = _chatterbox(settings.chatterbox_base_url, settings.chatterbox_model,
+                           settings.chatterbox_language, settings.chatterbox_voice)
         if not settings.chatterbox_non_english_model:
             return main
         # Two voices, picked per reply by the script the text is written in. The second one is
-        # started lazily, so an English-only day never loads it at all.
+        # started lazily, so an English-only day never loads it at all. It can clone a different
+        # reference clip: a Hindi sample makes the Hindi voice markedly better than an English
+        # speaker's timbre stretched over Devanagari. Empty means "use the same voice as English".
         from app.providers.tts.routed import LanguageRoutedTTS
 
         return LanguageRoutedTTS(main, _chatterbox(settings.chatterbox_non_english_url,
-                                                   settings.chatterbox_non_english_model, ""))
+                                                   settings.chatterbox_non_english_model, "",
+                                                   settings.chatterbox_non_english_voice or settings.chatterbox_voice))
     if p == TTSProviderName.LOCAL:
         return LocalTTS(settings.tts_voice, settings.tts_rate)
     if p == TTSProviderName.PIPER:

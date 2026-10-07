@@ -16,6 +16,7 @@ from app.providers.llm.anthropic import AnthropicProvider
 from app.providers.llm.ollama import OllamaProvider, StreamAccumulator, visible_text
 from app.providers.llm.openai_compat import OpenAICompatibleProvider
 from app.tasks.manager import TaskStatus
+from app.voice import wakeword
 from app.voice.wakeword import WakeWordService, phrase_matches
 
 
@@ -183,6 +184,44 @@ def test_wake_service_detection_cooldown_and_callback():
     assert hits == [("auto", "hey zeta")] and svc.detections == 1
     st = svc.status()
     assert st["enabled"] and not st["running"] and st["phrase"] == "hey zeta" and st["last_text"] == "hey zeta"
+
+
+# The numbers below are measured, not chosen: 25 s of this laptop's microphone array in an empty
+# room gave a median frame of 203, p90 232 and a loudest frame of 356, and a synthesized "Hey Zeta"
+# pushed through the engine is recognised down to about RMS 400.
+# 80 ms frame levels of a synthesized "hey zeta" scaled to an overall RMS of 400, loudest first.
+ROOM_FLOOR, ROOM_PEAK = 205.0, 356.0
+QUIET_PHRASE = [1050.0, 731.0, 699.0, 616.0, 521.0, 402.0]
+
+
+def test_the_gate_lets_a_quietly_spoken_phrase_through():
+    """The failure this fixes: detections=0 AND rejected=0 for eighty minutes. Nothing was being
+    rejected because nothing got as far as being judged - the old gate stood at 615, which four
+    of these frames clear when the engine wants five, so the phrase was dropped before Whisper,
+    the filters and the matcher ever saw it, and no counter anywhere moved."""
+    gate = wakeword.gate_rms(0.5, ROOM_FLOOR)
+    assert len([f for f in QUIET_PHRASE if f > gate]) >= 5
+    assert len([f for f in QUIET_PHRASE if f > 615.0]) < 5      # what it used to be
+
+
+def test_the_gate_still_sits_above_an_empty_room():
+    """It is a CPU guard: if room noise crosses it, the tiny model runs continuously for nothing."""
+    assert wakeword.gate_rms(0.5, ROOM_FLOOR) > ROOM_PEAK
+
+
+def test_turning_the_dial_up_lowers_the_bar_and_down_raises_it():
+    quiet_room = [wakeword.gate_rms(s, ROOM_FLOOR) for s in (0.0, 0.5, 1.0)]
+    assert quiet_room == sorted(quiet_room, reverse=True)
+    # ...and in a noisy room the gate follows the room rather than a constant
+    assert wakeword.gate_rms(0.5, 900.0) > wakeword.gate_rms(0.5, ROOM_FLOOR)
+
+
+def test_the_status_says_where_an_utterance_stopped():
+    """Read left to right it separates a dead microphone from a gate nothing crosses, from a VAD
+    that hears nothing, from filters that are too strict - which the old status could not."""
+    st = WakeWordService(enabled=True, phrase="hey zeta").status()
+    for key in ("frames", "level", "gate", "noise_floor", "heard", "too_short", "empty", "rejected"):
+        assert key in st, key
 
 
 def test_wake_service_disabled_does_not_start():

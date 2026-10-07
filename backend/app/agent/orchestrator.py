@@ -139,6 +139,7 @@ class Orchestrator:
             fallback_tools_text="" if native else tools_text(schemas),
             emotional=bool(self.emotion and self.emotion.enabled), speech_note=self.speech_note,
             support_mode=bool(self.emotion and self.emotion.support_mode),
+            languages=self.settings.stt_languages,
         )
         history = await self.short_term.history(task.conversation_id, self.settings.agent_history_messages)
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}, *history]

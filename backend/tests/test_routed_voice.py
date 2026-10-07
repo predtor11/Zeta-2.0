@@ -204,3 +204,77 @@ async def test_a_voice_server_that_is_not_running_holds_nothing(monkeypatch):
     monkeypatch.setattr(r.other, "release_gpu", refused)
     monkeypatch.setattr(r.english, "synthesize", speak)
     assert await r.synthesize(ENGLISH) == (b"RIFF", "audio/wav")
+
+
+# ------------------------------------------------------------------ one handover, not one per piece
+@pytest.mark.asyncio
+async def test_a_run_of_pieces_in_one_language_parks_the_other_voice_once(monkeypatch):
+    """A long reply is spoken as several clips, and the listener waits on every one of them.
+    Asking the idle voice to park before each is a round trip that buys nothing - it parked
+    before the first piece and nothing has touched the card since."""
+    r = _routed()
+    parked = []
+
+    async def park_other():
+        parked.append("multilingual")
+        return {"free": True, "busy": False, "parked": True}
+
+    async def speak(text, style=None, lead=True):
+        return b"RIFF", "audio/wav"
+
+    monkeypatch.setattr(r.other, "release_gpu", park_other)
+    monkeypatch.setattr(r.english, "synthesize", speak)
+    for piece in ("Done.", "I have opened Chrome.", "The pricing page is up."):
+        await r.synthesize(piece)
+    assert parked == ["multilingual"]
+
+
+@pytest.mark.asyncio
+async def test_changing_language_mid_reply_still_hands_the_card_over(monkeypatch):
+    """The saving must not extend to the case it was protecting against: two models resident on
+    an 8 GB card is the failure that looks like a hang."""
+    r = _routed()
+    parked = []
+
+    async def speak(text, style=None, lead=True):
+        return b"RIFF", "audio/wav"
+
+    for voice, name in ((r.english, "english"), (r.other, "multilingual")):
+        async def park(n=name):
+            parked.append(n)
+            return {"free": True, "busy": False, "parked": True}
+
+        monkeypatch.setattr(voice, "release_gpu", park)
+        monkeypatch.setattr(voice, "synthesize", speak)
+
+    await r.synthesize(ENGLISH)
+    await r.synthesize(HINDI)
+    await r.synthesize(ENGLISH)
+    assert parked == ["multilingual", "english", "multilingual"]
+
+
+@pytest.mark.asyncio
+async def test_a_language_model_turn_means_the_next_piece_parks_again(monkeypatch):
+    """`release_gpu` is the language model taking the card. Whatever the voice was holding is
+    gone, so the next thing spoken cannot assume the other voice is still out of the way."""
+    r = _routed()
+    parked = []
+
+    async def speak(text, style=None, lead=True):
+        return b"RIFF", "audio/wav"
+
+    for voice, name in ((r.english, "english"), (r.other, "multilingual")):
+        async def park(n=name):
+            parked.append(n)
+            return {"free": True, "busy": False, "parked": True}
+
+        monkeypatch.setattr(voice, "release_gpu", park)
+        monkeypatch.setattr(voice, "synthesize", speak)
+
+    await r.synthesize(ENGLISH)
+    parked.clear()
+    await r.release_gpu()                     # a turn happens: both voices come off the card
+    parked.clear()
+    await r.synthesize(ENGLISH)
+    assert parked == ["multilingual"]
+

@@ -145,6 +145,7 @@ class Engine:
         device = self._pick_device()
         try:
             self.model = self._load_weights(device)
+            self._fix_reference_dtype(self.model)
             self.device = device
         except Exception as e:  # noqa: BLE001
             # Out of VRAM (a local LLM is probably holding it) - CPU still works, just slower.
@@ -152,6 +153,7 @@ class Engine:
                 log.warning("CUDA load failed (%s: %s); falling back to CPU", type(e).__name__, str(e)[:160])
                 try:
                     self.model = self._load_weights("cpu")
+                    self._fix_reference_dtype(self.model)
                     self.device = "cpu"
                 except Exception as e2:  # noqa: BLE001
                     self.error = f"{type(e2).__name__}: {e2}"
@@ -260,6 +262,31 @@ class Engine:
                 return self._from_pretrained(device)
             finally:
                 os.environ.pop("HF_HUB_OFFLINE", None)
+
+    @staticmethod
+    def _fix_reference_dtype(model: Any) -> None:
+        """Work around a dtype bug that breaks voice cloning on Turbo.
+
+        `norm_loudness` scales the reference waveform by `10 ** (gain_db / 20)`, where gain_db
+        comes from pyloudnorm as a *numpy* float64 scalar. Multiplying a float32 array by one
+        promotes the whole waveform to float64, so the STFT downstream produces float64
+        magnitudes while the mel filter bank is float32, and the matmul dies with "expected
+        scalar type Double but found Float".
+
+        It only fires when an `audio_prompt_path` is given - the built-in voice uses precomputed
+        conditionals and never runs this path - which is why cloning failed the moment a
+        reference clip was configured. Casting the result back to float32 is enough.
+        """
+        import numpy as np
+
+        original = getattr(model, "norm_loudness", None)
+        if original is None:
+            return
+
+        def norm_loudness(wav, sr, target_lufs=-27):
+            return np.asarray(original(wav, sr, target_lufs), dtype=np.float32)
+
+        model.norm_loudness = norm_loudness
 
     def _from_pretrained(self, device: str) -> Any:
         """Turbo if the installed package has it, otherwise the standard model."""

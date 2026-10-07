@@ -56,6 +56,9 @@ export function endsWithQuestion(text: string): boolean {
 // Pauses only ever extend on the backend, so an over-estimate is free and an under-estimate is not.
 const deafen = (seconds: number) => api.wakePause(Math.min(120, seconds + 2.5)).catch(() => undefined);
 
+const JOIN_GAP = 0.16;          // fallback pause between pieces when the backend did not send one
+const SAFETY = 1.06;            // the estimates wobble by a few per cent; buy that much room
+
 export function useVoice(o: Options): VoiceState {
   const [recording, setRecording] = useState(false);
   const [mode, setMode] = useState<ListenMode>("manual");
@@ -77,7 +80,8 @@ export function useVoice(o: Options): VoiceState {
   const streamRef = useRef<MediaStream | null>(null);
   const micTimer = useRef<number>(0);
   const outTimer = useRef<number>(0);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const outRef = useRef<{ gain: GainNode; analyser: AnalyserNode } | null>(null);
+  const sourcesRef = useRef<AudioBufferSourceNode[]>([]);   // pieces scheduled on the audio clock
   const speechRef = useRef(0);                                   // bumped to cancel the reply being spoken
   const abortRef = useRef<AbortController | null>(null);
   const spokenRef = useRef<string | null>(null);
@@ -98,10 +102,16 @@ export function useVoice(o: Options): VoiceState {
     speechRef.current += 1;        // anything still playing or being fetched belongs to an older reply
     abortRef.current?.abort();
     abortRef.current = null;
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
+    // Pieces are scheduled ahead of time, so silencing the voice means stopping everything that
+    // has been queued, not only whatever happens to be audible.
+    for (const src of sourcesRef.current) {
+      try {
+        src.stop();
+      } catch {
+        /* already finished */
+      }
     }
+    sourcesRef.current = [];
     window.clearInterval(outTimer.current);
     levels.current.out = 0;
     setSpeaking(false);
@@ -193,48 +203,54 @@ export function useVoice(o: Options): VoiceState {
     [stop, stopSpeaking],
   );
 
-  const playClip = useCallback(async (blob: Blob, live: () => boolean) => {
-    const url = URL.createObjectURL(blob);
-    const a = new Audio(url);
-    audioRef.current = a;
-    try {
-      const ctx = audioCtx();
-      const src = ctx.createMediaElementSource(a);
+  // One output chain for the whole session: every piece is connected to the same gain node, so
+  // the level meter does not have to be rebuilt (and `createMediaElementSource`, which cannot be
+  // called twice on the same element, is out of the picture entirely).
+  const output = () => {
+    const ctx = audioCtx();
+    if (!outRef.current) {
+      const gain = ctx.createGain();
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
-      src.connect(analyser);
+      gain.connect(analyser);
       analyser.connect(ctx.destination);
-      const buf = new Float32Array(analyser.fftSize);
-      window.clearInterval(outTimer.current);
-      outTimer.current = window.setInterval(() => {
-        analyser.getFloatTimeDomainData(buf);
-        let sum = 0;
-        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-        levels.current.out = Math.min(1, Math.sqrt(sum / buf.length) * 6);
-      }, 50);
-    } catch {
-      /* analyser unavailable: play without levels */
+      outRef.current = { gain, analyser };
     }
-    // `duration` is only known once metadata has loaded; the caller has already deafened for a
-    // rate estimate, this just tops it up with the real length.
-    if (Number.isFinite(a.duration) && a.duration > 0) deafen(a.duration);
-    else a.onloadedmetadata = () => Number.isFinite(a.duration) && deafen(a.duration);
-    await new Promise<void>((resolve) => {
-      a.onended = () => resolve();
-      a.onerror = () => resolve();
-      a.onpause = () => resolve();
-      a.play().catch(() => resolve());
-    });
-    URL.revokeObjectURL(url);
-    if (audioRef.current === a && live()) audioRef.current = null;
-  }, []);
+    return outRef.current;
+  };
 
-  // Speak a reply piece by piece.
+  const meter = (analyser: AnalyserNode) => {
+    const buf = new Float32Array(analyser.fftSize);
+    window.clearInterval(outTimer.current);
+    outTimer.current = window.setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      levels.current.out = Math.min(1, Math.sqrt(sum / buf.length) * 6);
+    }, 50);
+  };
+
+  // Speak a reply.
   //
-  // The voice returns nothing until a whole clip is finished, so a long answer used to be a long
-  // silence - measured on this machine at roughly 40 ms per character, i.e. ~16 s before the first
-  // word of a 400-character reply. The backend splits the reply into sentences; each piece is
-  // requested while the previous one is playing, so the wait is only ever for the first sentence.
+  // The one fact that decides how this works: the voice generates speech more slowly than it is
+  // spoken - about 0.42x realtime on this card, so a second of speech costs roughly 2.4 seconds
+  // of work. Requesting a sentence, playing it, and requesting the next therefore runs dry at
+  // every join, and the gap grows with the length of the sentence before it. That was the
+  // stuttering.
+  //
+  // So the pieces are generated in order but not played on arrival. Playback starts only once
+  // every piece still to come will be *finished* before playback reaches it - which is not the
+  // same as "generation keeps up on average", because half a piece is silence. So the check walks
+  // the pieces that are left, pricing each from what the pieces already made actually cost, and
+  // compares when each one lands against when it would be needed. Treating generation as a
+  // steady stream instead says "safe" and then delivers the last piece five seconds late.
+  //
+  // Nothing here is a constant to be tuned: the per-character cost of speech and of work are both
+  // measured as it goes, so a faster machine simply starts sooner, and one that can outrun
+  // playback starts on the first piece.
+  //
+  // Everything in hand is then scheduled end to end on the audio clock, which joins the pieces
+  // sample-accurately instead of hoping a new <audio> element starts the instant the last ended.
   const speak = useCallback(
     async (text: string) => {
       if (!optsRef.current.ttsEnabled || !text.trim()) return;
@@ -243,8 +259,11 @@ export function useVoice(o: Options): VoiceState {
       const live = () => speechRef.current === token;
 
       let segments: string[] = [];
+      let gaps: number[] = [];
       try {
-        segments = (await api.speakPlan(text)).segments;
+        const plan = await api.speakPlan(text);
+        segments = plan.segments;
+        gaps = plan.gaps || [];
       } catch {
         segments = [text];              // planning failed: speak it in one go, as before
       }
@@ -252,27 +271,107 @@ export function useVoice(o: Options): VoiceState {
 
       const ac = new AbortController();
       abortRef.current = ac;
-      const fetchPiece = (i: number) =>
-        api
+      const ctx = audioCtx();
+      // Pieces are scheduled against `ctx.currentTime`, which does not advance while the context
+      // is suspended - so unlike an <audio> element, this has to be awake before anything is
+      // queued, not merely asked to wake up.
+      if (ctx.state !== "running") await ctx.resume().catch(() => undefined);
+      const { gain, analyser } = output();
+      setSpeaking(true);
+
+      const ready: { buf: AudioBuffer; gap: number }[] = [];
+      let madeAudio = 0;                // seconds of speech generated so far
+      let madeChars = 0;                // ...how many characters that was
+      let spentWall = 0;                // ...and how long it took
+      let allMade = false;
+      let queued = 0;                   // how many of `ready` are already on the audio clock
+      let started = false;
+      let nextStart = 0;                // audio-clock time the next piece begins
+      let last: AudioBufferSourceNode | null = null;
+
+      const enoughOfALead = () => {
+        if (allMade) return true;                                  // nothing left to wait for
+        const perAudio = madeAudio / Math.max(madeChars, 1);        // speech seconds per character
+        const perWork = spentWall / Math.max(madeChars, 1);         // seconds of work per character
+        let due = ready.reduce((t, piece) => t + piece.buf.duration + piece.gap, 0);
+        let lands = 0;
+        for (let j = ready.length; j < segments.length; j++) {
+          lands += segments[j].length * perWork * SAFETY;
+          if (lands > due) return false;
+          due += segments[j].length * perAudio + (gaps[j] ?? JOIN_GAP);
+        }
+        return true;
+      };
+
+      const pump = () => {
+        if (!ready.length) return;      // every piece failed: there is nothing to say
+        if (!started) {
+          if (!enoughOfALead()) return;
+          started = true;
+          nextStart = ctx.currentTime + 0.05;
+          meter(analyser);
+        }
+        for (; queued < ready.length; queued++) {
+          const { buf, gap } = ready[queued];
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(gain);
+          // `nextStart` is in the past only if the lead ran out despite everything; starting now
+          // is all that is left, and the join is audible. Nothing else can be done about it.
+          const when = Math.max(nextStart, ctx.currentTime + 0.02);
+          src.start(when);
+          sourcesRef.current.push(src);
+          last = src;
+          nextStart = when + buf.duration + gap;
+        }
+      };
+
+      for (let i = 0; i < segments.length; i++) {
+        // Deafen the wake word for about as long as this one piece should take, and no longer.
+        // `pause` on the backend only ever extends, so a generous flat window here is not free:
+        // it is why the microphone stayed shut long after Zeta had finished talking. The first
+        // piece has nothing measured yet and may have to wait out a parked model coming back,
+        // which is 25 s on this machine, so it gets a fixed allowance.
+        const perChar = madeChars ? spentWall / madeChars : 0;
+        deafen(perChar ? segments[i].length * perChar + 4 : 40);
+        const began = performance.now();
+        const blob = await api
           .speak(segments[i], { lead: i === 0, final: i === segments.length - 1, signal: ac.signal })
           .catch(() => null);
-
-      deafen(Math.min(90, 2 + text.length / 12));
-      setSpeaking(true);
-      let pending = fetchPiece(0);
-      for (let i = 0; i < segments.length; i++) {
-        const blob = await pending;
-        pending = i + 1 < segments.length ? fetchPiece(i + 1) : Promise.resolve(null);
         if (!blob || !live()) break;
-        await playClip(blob, live);
+        let buf: AudioBuffer;
+        try {
+          buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+        } catch {
+          break;                        // an undecodable piece: speak what there is rather than nothing
+        }
+        if (!live()) break;
+        spentWall += (performance.now() - began) / 1000;
+        madeAudio += buf.duration;
+        madeChars += segments[i].length;
+        ready.push({ buf, gap: i === segments.length - 1 ? 0 : gaps[i] ?? JOIN_GAP });
+        pump();
       }
       if (!live()) return;              // a newer reply took over; it owns the state now
+      allMade = true;
+      pump();                           // a short reply, or a failure part-way, still has to be said
+
+      const endsIn = started ? Math.max(0, nextStart - ctx.currentTime) : 0;
+      if (endsIn > 0) {
+        deafen(endsIn);                 // now the real length is known, not the estimate
+        await new Promise<void>((resolve) => {
+          const done = window.setTimeout(resolve, endsIn * 1000 + 200);
+          if (last) last.onended = () => { window.clearTimeout(done); resolve(); };
+        });
+      }
+      if (!live()) return;
       window.clearInterval(outTimer.current);
       levels.current.out = 0;
+      sourcesRef.current = [];
       abortRef.current = null;
       setSpeaking(false);
     },
-    [stopSpeaking, playClip],
+    [stopSpeaking],
   );
 
   // New assistant reply: speak it, then listen again if it ended with a question.

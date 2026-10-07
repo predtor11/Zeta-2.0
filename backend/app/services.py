@@ -265,7 +265,7 @@ class ZetaServices:
     def _build_wake(self, s: Settings) -> WakeWordService:
         return WakeWordService(enabled=bool(s.wake_word_enabled and s.is_local), phrase=s.wake_word, engine=s.wake_word_engine,
                                model=s.wake_word_model, sensitivity=s.wake_word_sensitivity, device=s.wake_word_device,
-                               on_wake=self.on_wake_word)
+                               whisper_model=s.wake_word_whisper_model, on_wake=self.on_wake_word)
 
     def on_wake_word(self, engine: str, text: str) -> None:
         """Called from the listener thread: hand over to the event loop and notify the UI."""

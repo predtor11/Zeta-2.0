@@ -16,8 +16,9 @@ from app.services import ZetaServices
 
 router = APIRouter(prefix="/api/voice", tags=["voice"], dependencies=[Depends(require_auth)])
 
-# Zeta will read out an essay if you let it. At ~40 ms a character that is several minutes of
-# talking, and nobody listens to the end. Long answers are read to here and left on screen.
+# Zeta will read out an essay if you let it. A character is about a sixteenth of a second of
+# speech - and about 0.13 s of work to make - so this is already several minutes of talking that
+# nobody listens to the end of. Long answers are read to here and left on screen.
 MAX_SPEECH_CHARS = 4000
 
 
@@ -86,20 +87,28 @@ async def speak(req: SpeakRequest, svc: ZetaServices = Depends(services)):
 async def speak_plan(req: SpeakRequest):
     """Split a reply into pieces that can be spoken one after another.
 
-    The voice generates a whole clip before it returns anything, so a 400-character answer is
-    about 16 seconds of silence on this machine. The UI asks for the pieces, then requests them
-    in order and plays each one while the next is still being made - so the first words arrive
-    in a few seconds regardless of how long the answer is.
+    The voice generates a whole clip before it returns anything, so a long answer asked for in
+    one go is a long silence. Splitting it lets the browser start playing while the rest is
+    still being made.
+
+    What it must *not* do is start too early. Generation runs at about 0.42x realtime here, so
+    every second of speech costs about 2.4 seconds of work: a player that starts on piece one
+    and hopes for the best runs dry at every join, which is what "it keeps pausing mid-sentence"
+    was. The browser therefore builds a lead first (see `speak` in useVoice.ts) and schedules the
+    pieces end to end. Splitting only makes that possible - it does not decide when to speak.
 
     Splitting happens here rather than in the browser because it has to agree with what the
     voice actually receives: Markdown removed first, so "**Done.**" does not become a sentence
     boundary in one place and not the other.
     """
-    from app.emotion.speech import segments, strip_markdown
+    from app.emotion.speech import pause_after, segments, strip_markdown
 
-    spoken = strip_markdown(req.text)[:MAX_SPEECH_CHARS]
-    pieces = segments(spoken)
-    return {"segments": pieces, "truncated": len(strip_markdown(req.text)) > MAX_SPEECH_CHARS}
+    spoken = strip_markdown(req.text)
+    pieces = segments(spoken[:MAX_SPEECH_CHARS])
+    # The silence to leave at each join. The pieces are separate clips, and the voice server drops
+    # the gap after its own final sentence, so without this they collide.
+    gaps = [pause_after(p) for p in pieces[:-1]] + [0.0] if pieces else []
+    return {"segments": pieces, "gaps": gaps, "truncated": len(spoken) > MAX_SPEECH_CHARS}
 
 
 @router.get("/audio/{audio_id}")

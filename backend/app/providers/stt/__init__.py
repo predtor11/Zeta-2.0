@@ -103,6 +103,7 @@ class WhisperSTT(STTProvider):
         # a two-second utterance it will cheerfully return Welsh or Urdu; narrowing the choice to
         # the ones that can really occur removes a whole class of nonsense transcripts.
         self.languages = [c.strip().lower() for c in (languages or "").split(",") if c.strip()]
+        self._warned_detect = False
         self.device = (device or "auto").lower()
         self.compute_type = compute_type or ("float16" if self.device == "cuda" else "int8" if self.device == "cpu" else "default")
         self._model = None
@@ -136,9 +137,19 @@ class WhisperSTT(STTProvider):
         if len(self.languages) == 1:
             return self.languages[0]
         try:
-            _, _, probs = self._model.detect_language(audio=path, vad_filter=True)
+            # `detect_language` wants a 1-D float array at 16 kHz, NOT a path. Handing it a path
+            # raises, and if that is swallowed quietly Whisper falls back to choosing from all 99
+            # languages - which is the exact failure this method exists to prevent. It produced a
+            # confident Portuguese transcript of Hindi speech before this was fixed.
+            from faster_whisper.audio import decode_audio
+
+            samples = decode_audio(path, sampling_rate=16000)
+            _, _, probs = self._model.detect_language(audio=samples, vad_filter=True)
         except Exception as e:  # noqa: BLE001
-            log.debug("language detection failed (%s); letting Whisper decide", e)
+            if not self._warned_detect:
+                self._warned_detect = True
+                log.warning("Language detection failed (%s: %s); Whisper is choosing from all languages, "
+                            "which STT_LANGUAGES is meant to prevent.", type(e).__name__, str(e)[:120])
             return None
         allowed = {c: p for c, p in probs if c in self.languages}
         if not allowed:

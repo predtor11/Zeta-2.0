@@ -87,7 +87,7 @@ export const api = {
   // A reply is spoken in pieces so playback can start before the whole clip exists.
   // `lead` marks the first piece (the only one allowed to open with a breath or a sigh) and
   // `final` the last (after which the backend puts the language model back on the GPU).
-  speakPlan: (text: string) => req<{ segments: string[]; truncated: boolean }>("/api/voice/speak/plan", { method: "POST", body: JSON.stringify({ text }) }),
+  speakPlan: (text: string) => req<{ segments: string[]; gaps: number[]; truncated: boolean }>("/api/voice/speak/plan", { method: "POST", body: JSON.stringify({ text }) }),
   speak: async (text: string, opts: { lead?: boolean; final?: boolean; signal?: AbortSignal } = {}): Promise<Blob> =>
     req<Blob>("/api/voice/speak", {
       method: "POST",

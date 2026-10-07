@@ -11,9 +11,9 @@ flatters the slower model, because fixed overheads dominate a short one:
   the same sentence - 0.17x realtime, about 2.4x turbo's cost per second of speech.
 
 So Zeta keeps both and picks per reply. Only one holds the graphics card at a time: before
-speaking, the other is parked into system RAM and comes back in 2-3 s when it is next needed.
-That is the same handover already used between the voice and the language model, so switching
-language costs one resume, not a model load.
+speaking, the other is parked into system RAM. Coming back is not free - the running servers
+report 25 s for turbo and 14 s for the multilingual model - so the handover is done once per
+run of pieces rather than once per piece, and never while a voice is mid-sentence.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ class LanguageRoutedTTS(TTSProvider):
     def __init__(self, english: ChatterboxTTS, other: ChatterboxTTS):
         self.english = english
         self.other = other
+        self._holder: Any = None      # the voice that last took the card, if nothing has taken it since
 
     # ------------------------------------------------------------------ routing
     def voice_for(self, text: str) -> ChatterboxTTS:
@@ -70,8 +71,18 @@ class LanguageRoutedTTS(TTSProvider):
 
     # ------------------------------------------------------------------ speaking
     async def synthesize(self, text: str, style: Any = None, lead: bool = True) -> Tuple[bytes, str]:
+        """Speak one piece, having first made sure the other voice is not sitting on the card.
+
+        A long reply arrives here as a run of pieces in the same language, and asking the other
+        voice to park before each one is a wasted round trip on the path the listener is waiting
+        on. So the last voice to take the card is remembered and the handover is skipped while it
+        keeps the card - forgotten the moment anything else claims it (`release_gpu`), because
+        then the parking really does have to happen again.
+        """
         voice = self.voice_for(text)
-        await self._free_card(self.other if voice is self.english else self.english)
+        if voice is not self._holder:
+            await self._free_card(self.other if voice is self.english else self.english)
+            self._holder = voice
         return await voice.synthesize(text, style, lead)
 
     async def _free_card(self, idle: ChatterboxTTS) -> bool:
@@ -99,6 +110,7 @@ class LanguageRoutedTTS(TTSProvider):
 
     async def release_gpu(self) -> Dict[str, Any]:
         """Hand the card back for a language-model turn: both voices, not just the busy one."""
+        self._holder = None
         a = await self.english.release_gpu()
         b = await self.other.release_gpu()
         return {"free": bool(a["free"] and b["free"]),

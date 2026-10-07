@@ -146,6 +146,7 @@ class Settings(BaseSettings):
     # picks per reply rather than making English pay for Hindi.
     chatterbox_non_english_model: str = ""        # "" = off. e.g. multilingual
     chatterbox_non_english_url: str = "http://127.0.0.1:8767"
+    chatterbox_non_english_voice: str = ""        # its own reference clip; "" = the same voice as English
     chatterbox_language: str = ""          # "" = detect from the reply (Devanagari -> Hindi); needs the multilingual model
     chatterbox_idle_unload: float = 300.0  # safety-net timer; Zeta parks the voice itself before each turn (0 = never)
     gpu_share: str = "auto"               # auto | on | off. On a small card, let the voice and the LLM take turns
@@ -159,6 +160,11 @@ class Settings(BaseSettings):
     wake_word_engine: str = "auto"       # auto | whisper | openwakeword
     wake_word_model: str = ""            # openwakeword model name/path (e.g. hey_jarvis) - whisper engine ignores it
     wake_word_sensitivity: float = 0.5   # openwakeword score threshold (0-1)
+    # Which faster-whisper model listens for the phrase (CPU, int8, only on gated audio). Measured
+    # on a 1.5 s "hey zeta": tiny writes "He's Zeta" at -0.59 confidence and takes ~1.0 s, base
+    # gets the words right at -0.07 and takes ~2.5 s, small is right but ~7.7 s. Drop to tiny if
+    # the CPU cost matters more than being heard first time.
+    wake_word_whisper_model: str = "base"
     wake_word_device: str = ""           # sounddevice input device name/index; empty = default microphone
 
     # ---- Filesystem --------------------------------------------------

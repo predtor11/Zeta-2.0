@@ -221,17 +221,21 @@ def language_of(text: str) -> str:
 _SENT_END = re.compile(r"(?<=[.!?…।])[\s\n]+")
 
 
-def segments(text: str, first_limit: int = 100, limit: int = 300) -> List[str]:
+def segments(text: str, first_limit: int = 60, limit: int = 140, hard_limit: int = 400) -> List[str]:
     """Split a reply into pieces that can be spoken one after another.
 
-    The voice generates a whole clip before returning anything, so a long answer means a
-    long silence. Splitting lets playback start after the first sentence while the rest is
-    still being made.
+    The voice generates a whole clip before returning anything and generates it more slowly than
+    it plays, so the browser has to know how much is still to come before it dares start (see
+    `speak` in useVoice.ts). Every piece it is given is a decision point: with 300-character
+    pieces a 400-character reply came down to "generate all of it, then talk", 55 s of silence
+    where 36 s would have done. Smaller pieces are checked more often and start sooner.
 
-    The first piece is deliberately short, because it is the only one the person actually
-    waits for: at the measured 0.42x realtime, 100 characters costs about 16 s against 25 s
-    for 160. Later pieces are longer, because fewer joins means better prosody, and by then
-    the wait is hidden behind whatever is already playing.
+    Two limits, because they answer different questions. `limit` is how much gets *packed*
+    together - purely a decision-granularity knob, and safe to lower, since the voice server
+    generates sentence by sentence anyway. `hard_limit` is the only thing that will cut a
+    sentence in half, which is a real cost: prosody dies at the seam and it is audible. So it is
+    set well above anything a person writes and is there to stop a runaway paragraph, nothing
+    more. The first piece is smaller again, because it is the only one anybody waits for.
     """
     words = _SENT_END.split(text.strip()) if text.strip() else []
     out: List[str] = []
@@ -241,9 +245,9 @@ def segments(text: str, first_limit: int = 100, limit: int = 300) -> List[str]:
         if not sentence:
             continue
         cap = first_limit if not out else limit
-        while len(sentence) > limit:                       # one enormous sentence
-            cut = sentence.rfind(" ", 0, limit)
-            cut = cut if cut > limit * 0.6 else limit
+        while len(sentence) > hard_limit:                  # one enormous sentence
+            cut = sentence.rfind(" ", 0, hard_limit)
+            cut = cut if cut > hard_limit * 0.6 else hard_limit
             if current:
                 out.append(current)
                 current = ""
@@ -260,6 +264,22 @@ def segments(text: str, first_limit: int = 100, limit: int = 300) -> List[str]:
     if current:
         out.append(current)
     return out
+
+
+# How long to leave between one spoken piece and the next.
+#
+# Pieces are generated as separate clips and butted together in the browser, so whatever silence
+# sits at the join is the pause the listener hears. The voice server already does this between the
+# sentences *inside* one clip and deliberately drops the gap after the last one (`gap_after` in
+# scripts/chatterbox_server.py, which these numbers mirror), because it does not know whether
+# anything follows. The join is where that missing gap has to come back: without it two sentences
+# collide, and with a fixed one the voice acquires a metronome.
+_PAUSES = {"?": 0.30, "!": 0.26, ".": 0.20, "…": 0.34, "।": 0.22, ",": 0.09, ":": 0.16, ";": 0.16}
+
+
+def pause_after(piece: str) -> float:
+    """Seconds of silence to place after `piece` before the next one starts."""
+    return _PAUSES.get(piece.rstrip()[-1:], 0.12)
 
 
 # --------------------------------------------------------------------------- delivery

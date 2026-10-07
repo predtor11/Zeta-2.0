@@ -239,6 +239,34 @@ It looks exactly like a fast cache hit.
 `CHATTERBOX_VOICE=voice/your_clip.wav`, and restart the voice server. One speaker, no music, no echo.
 Only clone a voice you have the right to use.
 
+The clip is the single biggest influence on how the finished voice sounds, and it is worth preparing
+rather than using a raw recording:
+
+* **Trim the silence** at both ends - leading room tone is wasted context and tends to make the clone
+  breathy at the start.
+* **Normalise the level.** A phone voice note straight out of WhatsApp measured -15 dBFS peak and
+  -40 dBFS average here; the speaker encoder works from this sample, and a quiet one comes back thin.
+  Around -20 dBFS RMS with the peak held below -1.5 dBFS is a good target.
+* **Keep it to 7-15 s, and never let trimming take it under 5 s.** The model asserts outright:
+  "Audio prompt must be longer than 5 seconds!". A 5.98 s preview with 5.46 s of speech in it is a
+  trap - the usual trim leaves it a few hundred milliseconds above the limit for no benefit. Check
+  the length after trimming, not before, and skip the trim when it is close.
+
+**Each language can clone a different person.** `CHATTERBOX_VOICE` is the English voice and
+`CHATTERBOX_NON_ENGLISH_VOICE` the other one; leaving the second empty makes both use the first.
+It is worth setting: an English speaker's timbre stretched over Devanagari is where the rough
+Hindi pronunciation came from, and a native Hindi sample clones far better for Hindi.
+* The clip is sent with each request, so changing it needs a backend restart, not a voice-server one.
+
+**A dtype bug in cloning, and the shim for it.** Turbo's `prepare_conditionals` scales the reference
+waveform by `10 ** (gain_db / 20)`, where `gain_db` arrives from pyloudnorm as a *numpy* float64
+scalar. Multiplying a float32 waveform by one promotes the whole array to float64, so the STFT
+produces float64 magnitudes while the mel filter bank stays float32, and the matmul fails with
+`expected scalar type Double but found Float`. It only fires when a reference clip is configured -
+the built-in voice uses precomputed conditionals and never runs that code - so cloning failed the
+instant `CHATTERBOX_VOICE` was set. `Engine._fix_reference_dtype` in the voice server wraps
+`norm_loudness` to cast the result back to float32.
+
 **The built-in voice is female** (measured pitch 219-267 Hz), so you get one without supplying a clip.
 
 **Speed, measured on an RTX 4070 Laptop (8 GB), Turbo model, nothing else on the GPU:**
@@ -256,13 +284,27 @@ overhead dominates. `torch.compile` does not currently help (CUDA graphs break o
 If a reply needs to be spoken the instant it appears, keep ElevenLabs; if you want a free, private,
 unlimited voice that can be cloned, keep Chatterbox. Both stay configured; `TTS_PROVIDER` switches.
 
-**Long replies are spoken in pieces.** Chatterbox returns nothing until the whole clip is finished,
-so a paragraph used to be twenty seconds of silence. `POST /api/voice/speak/plan` splits a reply into
-sentence-sized pieces and the UI requests each one while the previous is playing. Measured on a
-340-character reply this roughly halves the wait for the first word. It does **not** make playback
-gapless: generation runs at about 0.42x realtime, so it cannot stay ahead of the audio and there is
-a pause between sentences on a long reply. It starts sooner, which is the part that is felt.
-Replies longer than 4000 characters are read up to there and left on screen.
+**Long replies are spoken in pieces, but not played as they arrive.** Chatterbox returns nothing
+until a clip is finished, so `POST /api/voice/speak/plan` splits a reply into sentence-sized pieces
+and the UI requests them in order. What it must not do is play each one on arrival. Generation runs
+at about 0.42x realtime - 2.4 seconds of work per second of speech - so a player that starts on
+piece one runs dry at every join, and the gap grows with the piece before it: on a 350-character
+reply that was half a minute of dead air in the middle of a sentence.
+
+So the browser (`speak` in `frontend/src/hooks/useVoice.ts`) builds a lead first. Before starting it
+checks every piece still to come: priced at the per-character cost of speech and of work measured
+from the pieces already made, will each one be *finished* before playback reaches it? Only when the
+answer is yes for all of them does it begin, and everything in hand is scheduled end to end on the
+Web Audio clock, so the joins are sample-accurate rather than one `<audio>` element chasing the next.
+Both costs are measured as it goes, so a faster machine starts sooner and one that can generate
+faster than it speaks starts on the first piece.
+
+The honest consequence: below about 0.6x realtime the earliest gapless start is most of the way
+through generating the whole answer, so on a short reply this behaves like "make it all, then speak"
+- which is the point. A long reply does start earlier (a 500-character answer starts at 60 s rather
+than 69 s) and none of them stutter. The way to make the *first word* arrive sooner is a faster
+voice or a shorter answer, not a cleverer player. Replies longer than 4000 characters are read up to
+there and left on screen.
 
 **Markdown is never read out.** Everything the voice speaks goes through `strip_markdown()` in
 `backend/app/emotion/speech.py`: `**bold**`, `` `code` ``, headings, bullets, tables, link URLs and
@@ -317,7 +359,12 @@ CHATTERBOX_NON_ENGLISH_URL=http://127.0.0.1:8767
 ```
 
 Only one holds the graphics card at a time - before speaking, the other is parked into system RAM and
-comes back in 2-3 s, the same handover already used between the voice and the language model. The
+comes back in 2-3 s, the same handover already used between the voice and the language model. Zeta
+*waits* for that to happen rather than asking once and carrying on, because the alternative is not a
+small slowdown: with both models resident the 8 GB card was measured at 84 MB free, Windows moved the
+overflow into shared system RAM, and turbo fell from 9 iterations a second to one every 106 seconds -
+indistinguishable from a hang. If you drive the voice servers directly rather than through Zeta,
+nothing parks anything and you can reproduce exactly that. The
 second server is started lazily, the first time something non-English is actually said, so an
 English-only day never loads it. `GET /api/system/status` shows "not started yet" until then; that is
 normal, not a fault.

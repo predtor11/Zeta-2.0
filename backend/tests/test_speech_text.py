@@ -75,14 +75,27 @@ def test_the_first_piece_is_the_short_one():
     text = " ".join(f"This is sentence number {i} and it runs on for a while." for i in range(12))
     pieces = speech.segments(text)
     assert len(pieces) > 2
-    assert len(pieces[0]) <= 100
-    assert max(len(p) for p in pieces[1:]) > 100
+    assert len(pieces[0]) <= 60
+    assert max(len(p) for p in pieces[1:]) > 60
     assert " ".join(pieces) == text          # nothing lost, nothing invented
 
 
+def test_a_sentence_is_not_cut_in_half_to_make_the_pieces_smaller():
+    """Packing smaller is free - the voice server generates sentence by sentence whatever it is
+    handed. Cutting *inside* a sentence is not: the prosody dies at the seam, and it is audible.
+    So the packing limit must not be able to do it."""
+    sentence = ("This one sentence runs on well past the packing limit without ever stopping for "
+                "breath, and it keeps going for a good while after that as well, because people "
+                "do write like this")
+    assert len(sentence) > 140
+    assert speech.segments(sentence) == [sentence]
+
+
 def test_an_enormous_sentence_is_still_split():
+    """A runaway paragraph with no full stop in it has to give way somewhere."""
     pieces = speech.segments("word " * 400)
-    assert pieces and all(len(p) <= 300 for p in pieces)
+    assert pieces and all(len(p) <= 400 for p in pieces)
+    assert max(len(p) for p in pieces) > 140          # and not at the packing limit
 
 
 def test_hindi_sentences_split_on_the_danda():
@@ -125,8 +138,43 @@ async def test_the_plan_endpoint_hands_back_speakable_pieces():
 
 
 @pytest.mark.asyncio
+async def test_every_piece_is_told_how_long_to_wait_before_the_next():
+    """The pieces are separate clips glued together in the browser, so if nobody supplies the
+    silence at the join the sentences collide. Nothing follows the last one, so it gets none."""
+    from app.api.routes.voice import speak_plan
+    from app.models.schemas import SpeakRequest
+
+    out = await speak_plan(SpeakRequest(text="**Right.** " + "This is a sentence about the thing. " * 20))
+    assert len(out["gaps"]) == len(out["segments"])
+    assert out["gaps"][-1] == 0.0
+    assert all(g > 0 for g in out["gaps"][:-1])
+
+
+def test_a_question_is_given_longer_to_land_than_a_comma():
+    """The point of varying it: a fixed pause after every sentence is a metronome, and a
+    metronome is the most synthetic thing a voice can do."""
+    assert speech.pause_after("Shall I go ahead?") > speech.pause_after("Right, so,")
+    assert speech.pause_after("no punctuation here") > 0
+
+
+def test_the_join_matches_the_gaps_the_voice_server_uses():
+    """`pause_after` exists only because the voice server drops the silence after its own final
+    sentence. If the two ever disagree, the pause you hear inside a clip stops matching the pause
+    between clips - which is audible, and is exactly what nobody would think to check."""
+    import ast
+    import pathlib
+    import re
+
+    source = (pathlib.Path(__file__).resolve().parents[2] / "scripts" / "chatterbox_server.py").read_text(encoding="utf-8")
+    body = re.search(r"def gap_after.*?return (\{.*?\})\.get", source, re.S)
+    assert body, "gap_after no longer looks like a dict lookup; check it by hand"
+    assert ast.literal_eval(body.group(1)) == speech._PAUSES
+
+
+@pytest.mark.asyncio
 async def test_an_essay_is_read_to_a_point_and_says_so():
-    """At ~40 ms a character, a 20,000-character answer is thirteen minutes of talking."""
+    """A character is about a sixteenth of a second of speech, so a 20,000-character answer is
+    twenty minutes of talking - and, at 0.42x realtime, the better part of an hour to make."""
     from app.api.routes.voice import MAX_SPEECH_CHARS, speak_plan
     from app.models.schemas import SpeakRequest
 
